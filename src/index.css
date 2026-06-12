@@ -1,0 +1,26 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+body {
+  @apply bg-slate-950 text-slate-100 font-sans antialiased overflow-y-scroll overflow-x-hidden;
+  background-image: radial-gradient(circle at 50% 0%, #0f172a 0%, #020617 100%);
+  background-attachment: fixed;
+}
+
+/* Custom scrollbar for inner panels */
+.hide-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+.hide-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.hide-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgba(51, 65, 85, 0.5);
+  border-radius: 10px;
+}
