@@ -222,40 +222,77 @@ function calculateGGShotServer(candles: any[], bbPeriod: number, bbDev: number) 
   return { mid, upper, lower, bbSignals, trendLine, iTrend, signals, adx, ema200_4h };
 }
 
-async function sendTelegramMessage(message: string, imageType?: "LONG"|"SHORT") {
-  const activeToken = process.env.TELEGRAM_BOT_TOKEN;
-  const activeChatId = process.env.TELEGRAM_CHAT_ID;
-  if (!activeToken || !activeChatId) return false;
+const telegramQueue: { message: string, imageType?: "LONG"|"SHORT", resolve: Function, reject: Function }[] = [];
+let isProcessingTelegramQueue = false;
 
-  let telegramUrl = `https://api.telegram.org/bot${activeToken}/sendMessage`;
-  let fetchOptions: any = {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: activeChatId, text: message, parse_mode: "HTML", disable_web_page_preview: true })
-  };
+async function processTelegramQueue() {
+  if (isProcessingTelegramQueue) return;
+  isProcessingTelegramQueue = true;
+  
+  while (telegramQueue.length > 0) {
+    const item = telegramQueue[0];
+    try {
+      const activeToken = process.env.TELEGRAM_BOT_TOKEN;
+      const activeChatId = process.env.TELEGRAM_CHAT_ID;
+      if (!activeToken || !activeChatId) {
+        throw new Error("Telegram credentials are not configured on the server.");
+      }
 
-  if (imageType) {
-    const fs = typeof require !== 'undefined' ? require('fs') : await import('fs');
-    const imagePath = path.join(process.cwd(), "src/assets/images", imageType === "LONG" ? "long.jpg" : "short.jpg");
-    
-    if (fs.existsSync(imagePath)) {
-      telegramUrl = `https://api.telegram.org/bot${activeToken}/sendPhoto`;
-      const form = new FormData();
-      form.append("chat_id", activeChatId);
-      form.append("caption", message);
-      form.append("parse_mode", "HTML");
-      const buffer = fs.readFileSync(imagePath);
-      form.append("photo", new Blob([buffer], { type: "image/jpeg" }), `${imageType.toLowerCase()}.jpg`);
-      fetchOptions = { method: "POST", body: form };
+      let telegramUrl = `https://api.telegram.org/bot${activeToken}/sendMessage`;
+      let fetchOptions: any = {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: activeChatId, text: item.message, parse_mode: "HTML", disable_web_page_preview: true })
+      };
+
+      if (item.imageType === "LONG" || item.imageType === "SHORT") {
+        const fs = typeof require !== 'undefined' ? require('fs') : await import('fs');
+        const imagePath = path.join(process.cwd(), "src/assets/images", item.imageType === "LONG" ? "long.jpg" : "short.jpg");
+        
+        if (fs.existsSync(imagePath)) {
+          telegramUrl = `https://api.telegram.org/bot${activeToken}/sendPhoto`;
+          const form = new FormData();
+          form.append("chat_id", activeChatId);
+          form.append("caption", item.message);
+          form.append("parse_mode", "HTML");
+          const buffer = fs.readFileSync(imagePath);
+          form.append("photo", new Blob([buffer], { type: "image/jpeg" }), `${item.imageType.toLowerCase()}.jpg`);
+          fetchOptions = { method: "POST", body: form };
+        }
+      }
+
+      const response = await fetch(telegramUrl, fetchOptions);
+      const telegramData = await response.json() as any;
+
+      if (!response.ok || !telegramData.ok) {
+        if (telegramData.error_code === 429 && telegramData.parameters?.retry_after) {
+          const retryAfter = telegramData.parameters.retry_after;
+          console.warn(`[TELEGRAM RATE LIMIT] 429 Too Many Requests. Waiting ${retryAfter}s before retry...`);
+          await new Promise(r => setTimeout(r, retryAfter * 1000 + 500));
+          continue; // Retry this item
+        } else {
+          console.error("Telegram API Error:", telegramData);
+          throw new Error(telegramData.description || `Telegram response status ${response.status}`);
+        }
+      }
+      
+      item.resolve(telegramData);
+    } catch (e: any) {
+      item.reject(e);
     }
-  }
 
-  try {
-    const response = await fetch(telegramUrl, fetchOptions);
-    return response.ok;
-  } catch (e) {
-    return false;
+    telegramQueue.shift(); // Remove completed/failed
+    await new Promise(r => setTimeout(r, 2000)); // Enforce global rate limiting (1.5 - 2s)
   }
+  
+  isProcessingTelegramQueue = false;
+}
+
+function sendTelegramMessage(message: string, imageType?: "LONG"|"SHORT"): Promise<any> {
+  return new Promise((resolve, reject) => {
+    telegramQueue.push({ message, imageType, resolve, reject });
+    processTelegramQueue();
+  });
 }
 
 dotenv.config();
@@ -611,67 +648,15 @@ app.get("/api/telegram/status", (req, res) => {
 app.post("/api/telegram/notify", async (req, res) => {
   try {
     const { message, imageType } = req.body;
-    const activeToken = process.env.TELEGRAM_BOT_TOKEN;
-    const activeChatId = process.env.TELEGRAM_CHAT_ID;
-
-    if (!activeToken || !activeChatId) {
-      return res.status(400).json({
-        success: false,
-        message: "Telegram credentials are not configured on the server. Please define TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Environment Variables."
-      });
-    }
-
-    let telegramUrl = `https://api.telegram.org/bot${activeToken}/sendMessage`;
-    let fetchOptions: any = {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        chat_id: activeChatId,
-        text: message,
-        parse_mode: "HTML",
-        disable_web_page_preview: true
-      })
-    };
-
-    if (imageType === "LONG" || imageType === "SHORT") {
-      telegramUrl = `https://api.telegram.org/bot${activeToken}/sendPhoto`;
-      const fs = typeof require !== 'undefined' ? require('fs') : await import('fs');
-      const imagePath = path.join(process.cwd(), "src/assets/images", imageType === "LONG" ? "long.jpg" : "short.jpg");
-      
-      if (fs.existsSync(imagePath)) {
-        const form = new FormData();
-        form.append("chat_id", activeChatId);
-        form.append("caption", message);
-        form.append("parse_mode", "HTML");
-        
-        const buffer = fs.readFileSync(imagePath);
-        form.append("photo", new Blob([buffer], { type: "image/jpeg" }), `${imageType.toLowerCase()}.jpg`);
-        
-        fetchOptions = {
-          method: "POST",
-          body: form
-        };
-      }
-    }
-
-    const response = await fetch(telegramUrl, fetchOptions);
-    const telegramData = await response.json() as any;
-
-    if (!response.ok || !telegramData.ok) {
-      console.error("Telegram API Error:", telegramData);
-      throw new Error(telegramData.description || `Telegram response status ${response.status}`);
-    }
-
+    await sendTelegramMessage(message, imageType);
     res.json({
       success: true,
-      message: "Telegram notification relay succeeded!"
+      message: "Telegram notification queued successfully!"
     });
   } catch (error: any) {
     res.status(500).json({
       success: false,
-      message: error.message || "Failed to trigger Telegram notification."
+      message: error.message || "Failed to queue Telegram notification."
     });
   }
 });

@@ -1,4 +1,4 @@
-import { useEffect, useState, ReactNode, useMemo, useRef } from 'react';
+import { useEffect, useState, ReactNode, useMemo, useRef, Dispatch, SetStateAction } from 'react';
 import { 
   Activity, 
   Wallet, 
@@ -58,6 +58,28 @@ interface BinanceStatus {
   serverTime: string;
 }
 
+function usePersistentState<T>(key: string, initialValue: T): [T, Dispatch<SetStateAction<T>>] {
+  const [state, setState] = useState<T>(() => {
+    try {
+      const item = window.localStorage.getItem(key);
+      return item ? JSON.parse(item) : initialValue;
+    } catch (error) {
+      console.warn(`Error reading localStorage key "${key}":`, error);
+      return initialValue;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(key, JSON.stringify(state));
+    } catch (error) {
+      console.warn(`Error setting localStorage key "${key}":`, error);
+    }
+  }, [key, state]);
+
+  return [state, setState];
+}
+
 export default function App() {
   // Real-time market state for ALL 10 coins
   const [coinsCandles, setCoinsCandles] = useState<Record<string, any[]>>({});
@@ -70,16 +92,16 @@ export default function App() {
     totalPnl: 0,
   });
 
-  // Technical Algorithmic Defence Gates Toggles (Enabled by default)
-  const [filterAdx, setFilterAdx] = useState(true);
-  const [filterMtf, setFilterMtf] = useState(true);
-  const [filterEma, setFilterEma] = useState(true);
-  const [filterVolume, setFilterVolume] = useState(true);
-  const [filterFunding, setFilterFunding] = useState(true);
-  const [filterLiquidity, setFilterLiquidity] = useState(true);
+  // Technical Algorithmic Defence Gates Toggles (Persisted via memory)
+  const [filterAdx, setFilterAdx] = usePersistentState('ggshot_filterAdx', true);
+  const [filterMtf, setFilterMtf] = usePersistentState('ggshot_filterMtf', true);
+  const [filterEma, setFilterEma] = usePersistentState('ggshot_filterEma', true);
+  const [filterVolume, setFilterVolume] = usePersistentState('ggshot_filterVolume', true);
+  const [filterFunding, setFilterFunding] = usePersistentState('ggshot_filterFunding', true);
+  const [filterLiquidity, setFilterLiquidity] = usePersistentState('ggshot_filterLiquidity', true);
 
   // Simulation speed & tick controllers
-  const [isPlaying, setIsPlaying] = useState(true);
+  const [isPlaying, setIsPlaying] = usePersistentState('ggshot_isPlaying', true);
   const [simSpeed, setSimSpeed] = useState<'Normal' | 'Fast'>('Normal');
   const [tickCount, setTickCount] = useState(0);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
