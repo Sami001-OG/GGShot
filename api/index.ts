@@ -572,23 +572,9 @@ app.get("/api/binance/prices", async (req, res) => {
       prices: usdtPrices
     });
   } catch (error: any) {
-    // Graceful fallback for networks with blocked access/CORS
     res.json({
       success: false,
-      source: "Simulation Model (Binance API offline or restricted)",
-      message: error.message || "Failed to contact Binance Futures API",
-      prices: {
-        BTC: 69250.40,
-        ETH: 3740.15,
-        SOL: 165.80,
-        APE: 1.325,
-        SUI: 1.8250,
-        XRP: 0.5840,
-        ADA: 0.4450,
-        PEPE: 0.000012,
-        DOGE: 0.1452,
-        WIF: 2.89
-      }
+      message: error.message || "Failed to contact Binance Futures API"
     });
   }
 });

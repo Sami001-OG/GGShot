@@ -29,11 +29,7 @@ import { ActiveTrade, ClosedTrade } from './types';
 import { calculateGGShot } from './lib/indicators';
 import { COIN_CONFIGS, DEFAULT_CONFIG } from './lib/ggshot_1h_config';
 import { 
-  MONITORED_COINS, 
-  generateHistoryForCoin, 
-  tickCandle, 
-  appendNextCandle, 
-  spawnTradeOfCondition 
+  MONITORED_COINS
 } from './lib/simulation';
 import { cn, formatPrice } from './lib/utils';
 import { AnimatePresence, motion } from 'motion/react';
@@ -100,17 +96,12 @@ export default function App() {
   const [filterFunding, setFilterFunding] = usePersistentState('ggshot_filterFunding', true);
   const [filterLiquidity, setFilterLiquidity] = usePersistentState('ggshot_filterLiquidity', true);
 
-  // Simulation speed & tick controllers
-  const [isPlaying, setIsPlaying] = usePersistentState('ggshot_isPlaying', true);
-  const [simSpeed, setSimSpeed] = useState<'Normal' | 'Fast'>('Normal');
-  const [tickCount, setTickCount] = useState(0);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
 
   // Binance API Connection States
   const [binanceStatus, setBinanceStatus] = useState<BinanceStatus | null>(null);
   const [livePrices, setLivePrices] = useState<Record<string, number>>({});
   const [apiError, setApiError] = useState<string | null>(null);
-  const [loadingStatus, setLoadingStatus] = useState(true);
   
   // Graph focus
   const [selectedCoin, setSelectedCoin] = useState<string>('SOL');
@@ -531,11 +522,7 @@ export default function App() {
           const next = { ...prev };
           let updated = false;
           Object.entries(pricesData.prices).forEach(([coin, price]) => {
-            if (!next[coin]) {
-              // Auto-seed candles for all discovered futures contracts in real-time
-              next[coin] = generateHistoryForCoin(coin, price as number, 200);
-              updated = true;
-            } else {
+            if (next[coin]) {
               const list = [...next[coin]];
               if (list.length > 0) {
                 const last = { ...list[list.length - 1] };
@@ -550,12 +537,10 @@ export default function App() {
         });
       }
       if (!pricesData.success) {
-        setApiError("Using responsive offline sandbox model");
+        setApiError("Failed to fetch Binance data");
       }
     } catch (e: any) {
-      setApiError("Express service simulation mode");
-    } finally {
-      setLoadingStatus(false);
+      setApiError("Offline mode - cannot connect to API");
     }
   };
 
@@ -580,18 +565,16 @@ export default function App() {
             if (data && data.success && data.candles && data.candles.length > 0) {
               initialCandles[coin] = data.candles;
             } else {
-              const fallbackConfig = MONITORED_COINS.find(c => c.name === coin);
-              initialCandles[coin] = generateHistoryForCoin(coin, fallbackConfig?.price || 1.0, 200);
+              writeLog(`[ERROR] Failed to fetch historical data for ${coin}USDT from Binance API`);
             }
           } catch (err) {
-            const fallbackConfig = MONITORED_COINS.find(c => c.name === coin);
-            initialCandles[coin] = generateHistoryForCoin(coin, fallbackConfig?.price || 1.0, 200);
+             writeLog(`[ERROR] Failed to fetch historical data for ${coin}USDT from Binance API`);
           }
         })
       );
 
       setCoinsCandles(initialCandles);
-      writeLog(`SUCCESS: Seeded 300h real-market history buffers for ${MAJOR_FUTURES.length} primary pairs.`);
+      writeLog(`SUCCESS: Seeded 300h real-market history buffers for ${Object.keys(initialCandles).length} primary pairs.`);
       writeLog("BOT SCANNER LIVE: Scanning all futures symbols...");
     };
 
@@ -622,215 +605,6 @@ export default function App() {
     loadSelectedHistory();
     return () => { isMounted = false; };
   }, [selectedCoin]);
-
-  // 1. Core Simulation Tick Loop
-  useEffect(() => {
-    if (!isPlaying || Object.keys(coinsCandles).length === 0) return;
-
-    // Tick every 1500ms
-    const interval = setInterval(() => {
-      setTickCount(t => t + 1);
-
-      // We determine if we close the candle and start a new one
-      const ticksPerCandle = simSpeed === 'Normal' ? 12 : 5;
-      const shouldCloseCandle = (tickCount % ticksPerCandle === 0 && tickCount > 0);
-
-      setCoinsCandles(prev => {
-        const nextCoins: Record<string, any[]> = {};
-        
-        for (const coin of Object.keys(prev)) {
-          let list = [...prev[coin]];
-          if (list.length === 0) continue;
-
-          if (shouldCloseCandle) {
-            // Close old candle and open next
-            const nextCandle = appendNextCandle(list);
-            list.push(nextCandle);
-            if (list.length > 250) list.shift();
-
-            // Run indicator on the freshly closed candles to check signal matches!
-            const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
-            const res = calculateGGShot(list, config.bbPeriod, config.bbDev);
-            const lastSignal = res.signals[res.signals.length - 2]; // Signal of the closed candle
-
-            if (lastSignal) {
-              const entry = list[list.length - 2].close;
-              
-              // Extract technical values for filtering
-              const latestIdx = res.adx.length - 2;
-              const adxVal = res.adx[latestIdx] ?? 0;
-              const volRatio = res.volumeRatio ?? 1.0;
-              const mtfTrend = res.mtf4hITrend ?? 0;
-              const funding = res.fundingRate ?? 0;
-              const liquidity = res.volume24hUsdt ?? 20000000;
-              const ema200val = res.ema200_4h?.[res.ema200_4h.length - 2] ?? entry;
-
-              // Filter 1: ADX (strong trend validation)
-              if (filterAdx && adxVal <= 25) {
-                writeLog(`[FILTERED OUT] ${coin} ${lastSignal} Signal at $${formatPrice(entry)} rejected because trend is sideways (ADX: ${adxVal.toFixed(1)} <= 25)`);
-                continue; // Skip triggering trade on this coin
-              }
-
-              // Filter 2: Multi-Timeframe Confirmation (4H alignment)
-              if (filterMtf) {
-                if (lastSignal === 'LONG' && mtfTrend !== 1) {
-                  writeLog(`[FILTERED OUT] ${coin} LONG Signal at $${formatPrice(entry)} rejected: 4H Timeframe is Bearish/Neutral`);
-                  continue;
-                }
-                if (lastSignal === 'SHORT' && mtfTrend !== -1) {
-                  writeLog(`[FILTERED OUT] ${coin} SHORT Signal at $${formatPrice(entry)} rejected: 4H Timeframe is Bullish/Neutral`);
-                  continue;
-                }
-              }
-
-              // Filter 3: 4H EMA 200 Trend Line
-              if (filterEma) {
-                if (lastSignal === 'LONG' && entry <= ema200val) {
-                  writeLog(`[FILTERED OUT] ${coin} LONG Signal at $${formatPrice(entry)} rejected: Price <= 4H EMA 200 (${formatPrice(ema200val)})`);
-                  continue;
-                }
-                if (lastSignal === 'SHORT' && entry >= ema200val) {
-                  writeLog(`[FILTERED OUT] ${coin} SHORT Signal at $${formatPrice(entry)} rejected: Price >= 4H EMA 200 (${formatPrice(ema200val)})`);
-                  continue;
-                }
-              }
-
-              // Filter 4: Volume Participation Breakout
-              if (filterVolume && volRatio <= 1.5) {
-                writeLog(`[FILTERED OUT] ${coin} ${lastSignal} Signal at $${formatPrice(entry)} rejected: Breakout Volume ratio ${volRatio.toFixed(2)}x <= 1.5x`);
-                continue;
-              }
-
-              // Filter 4: Funding Rate overcrowding check
-              if (filterFunding) {
-                const fundingPct = funding * 100;
-                if (lastSignal === 'LONG' && funding >= 0.05) {
-                  writeLog(`[FILTERED OUT] ${coin} LONG Signal at $${formatPrice(entry)} rejected: Long overcrowding (Funding Rate ${fundingPct.toFixed(4)}% exceeds +0.05% safety limit)`);
-                  continue;
-                }
-                if (lastSignal === 'SHORT' && funding <= -0.05) {
-                  writeLog(`[FILTERED OUT] ${coin} SHORT Signal at $${formatPrice(entry)} rejected: Short overcrowding (Funding Rate ${fundingPct.toFixed(4)}% is below -0.05% safety limit)`);
-                  continue;
-                }
-              }
-
-              // Filter 5: Liquidity limit gate
-              if (filterLiquidity && liquidity < 30000000) {
-                const liquidityM = liquidity / 1000000;
-                writeLog(`[FILTERED OUT] ${coin} ${lastSignal} Signal at $${formatPrice(entry)} rejected: 24h Volume $${liquidityM.toFixed(1)}M under $30M liquidity gate`);
-                continue;
-              }
-              
-              setActiveTrades(active => {
-                const existingIndex = active.findIndex(t => t.symbol === coin);
-                let nextActive = [...active];
-
-                if (existingIndex !== -1) {
-                  const existingTrade = active[existingIndex];
-                  if (existingTrade.direction !== lastSignal) {
-                    // Reversal exit: close existing trade
-                    const { closedTrade } = processTradeUpdate(existingTrade, entry, true);
-                    if (closedTrade) {
-                      setClosedTrades(history => {
-                        if (history.some(t => t.id === closedTrade.id)) return history;
-                        return [closedTrade, ...history].slice(0, 40);
-                      });
-                    }
-                    nextActive = nextActive.filter(t => t.id !== existingTrade.id);
-                  } else {
-                    // Same direction: do not duplicate
-                    return active;
-                  }
-                }
-
-                const newTrade = spawnTradeOfCondition(coin, lastSignal, entry);
-                writeLog(`>>> SIGNAL COIN: ${coin} ${lastSignal} @ $${formatPrice(entry)} triggered on TrendLine inversion!`);
-                
-                // Asynchronously register in Mongoose
-                fetch("/api/trades/record", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    localId: newTrade.id,
-                    symbol: newTrade.symbol,
-                    direction: newTrade.direction,
-                    entryPrice: newTrade.entry,
-                    status: "OPEN"
-                  })
-                })
-                .then(res => res.json())
-                .then(data => {
-                  if (data.success && data.tradeId) {
-                    newTrade.dbId = data.tradeId;
-                    
-                    // Now that we have the real DB ID (DDMMXXX), send via Telegram
-                    sendTelegramNotification(
-                      `🤖 <b>New Trade Signal</b>\n\n` +
-                      `🆔 <b>trade id:</b> ${newTrade.dbId}\n` +
-                      `🪙 <b>symbol:</b> #${coin}USDT\n` +
-                      `📈 <b>direction:</b> ${newTrade.direction}\n` +
-                      `🎯 <b>tps:</b>\n` +
-                      `  TP1: $${formatPrice(newTrade.tps[0])}\n` +
-                      `  TP2: $${formatPrice(newTrade.tps[1])}\n` +
-                      `  TP3: $${formatPrice(newTrade.tps[2])}\n` +
-                      `  TP4: $${formatPrice(newTrade.tps[3])}\n` +
-                      `🛑 <b>sl:</b> $${formatPrice(newTrade.sl)}`,
-                      newTrade.direction
-                    ).catch(() => {});
-
-                    // Make sure the active array gets updated with the dbId
-                    setActiveTrades(trades => trades.map(t => t.id === newTrade.id ? { ...t, dbId: newTrade.dbId } : t));
-                  }
-                })
-                .catch(err => writeLog(`[DB ERROR] Failed to record trade ${newTrade.id}: ${err.message}`));
-
-                return [...nextActive, newTrade];
-              });
-            }
-          } else {
-            // Just tick update the current open candle
-            const idx = list.length - 1;
-            list[idx] = tickCandle(list[idx], 0.002);
-          }
-
-          nextCoins[coin] = list;
-        }
-
-        return nextCoins;
-      });
-
-      // 2. Drive active positions based on current prices and determine TP4/SL triggers
-      setActiveTrades(prevTrades => {
-        const remaining: ActiveTrade[] = [];
-        
-        prevTrades.forEach(trade => {
-          const coinData = coinsCandles[trade.symbol];
-          if (!coinData || coinData.length === 0) {
-            remaining.push(trade);
-            return;
-          }
-
-          const currentPrice = coinData[coinData.length - 1].close;
-
-          const { nextActive, closedTrade } = processTradeUpdate(trade, currentPrice);
-          if (closedTrade) {
-            setClosedTrades(history => {
-              if (history.some(t => t.id === closedTrade.id)) return history;
-              return [closedTrade, ...history].slice(0, 40);
-            });
-          }
-          if (nextActive) {
-            remaining.push(nextActive);
-          }
-        });
-
-        return remaining;
-      });
-
-    }, 1200);
-
-    return () => clearInterval(interval);
-  }, [isPlaying, simSpeed, tickCount, coinsCandles, activeTrades]);
 
   // Selected coin's indicator outputs
   const coinConfig = COIN_CONFIGS[selectedCoin] || DEFAULT_CONFIG;
@@ -901,8 +675,8 @@ export default function App() {
                  <h1 className="font-display text-[15px] font-bold text-slate-100 flex items-center gap-2 tracking-tight">GG-SHOT <span className="px-1.5 py-[3px] bg-indigo-500/15 text-indigo-400 text-[9px] uppercase tracking-widest rounded font-black border border-indigo-500/20 leading-none">PRO</span></h1>
                  <div className="h-4 w-px bg-slate-800/80 hidden sm:block"></div>
                  <div className="hidden sm:flex items-center gap-2">
-                    <span className={cn("h-1.5 w-1.5 rounded-full border border-slate-900 outline flex", isPlaying ? "bg-emerald-500 outline-emerald-500/30 animate-pulse" : "bg-rose-500 outline-rose-500/30")}></span>
-                    <span className="font-mono text-[9px] font-bold text-slate-400 uppercase tracking-widest pl-1">Sys: {isPlaying ? "Active" : "Paused"}</span>
+                    <span className="h-1.5 w-1.5 rounded-full border border-slate-900 outline flex bg-emerald-500 outline-emerald-500/30 animate-pulse"></span>
+                    <span className="font-mono text-[9px] font-bold text-slate-400 uppercase tracking-widest pl-1">Sys: Active</span>
                  </div>
              </div>
 
@@ -926,16 +700,6 @@ export default function App() {
                  >
                     <Database size={10} strokeWidth={3}/>
                     Trigger Daily Report
-                 </button>
-
-                 <button 
-                    onClick={() => setIsPlaying(!isPlaying)}
-                    className={cn("flex items-center gap-2 px-3 py-1.5 rounded-[4px] font-bold text-[9px] uppercase tracking-widest transition-all border",
-                       isPlaying ? "bg-amber-500/5 text-amber-500 border-amber-500/20 hover:bg-amber-500/10" : "bg-emerald-500/5 text-emerald-500 border-emerald-500/20 hover:bg-emerald-500/10"
-                    )}
-                 >
-                    {isPlaying ? <Pause size={10} strokeWidth={3}/> : <Play size={10} strokeWidth={3}/>}
-                    {isPlaying ? "Suspend Feed" : "Resume Feed"}
                  </button>
              </div>
          </header>
