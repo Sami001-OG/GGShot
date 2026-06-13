@@ -1,4 +1,10 @@
 {
+  "crons": [
+    {
+      "path": "/api/cron",
+      "schedule": "2 * * * *"
+    }
+  ],
   "functions": {
     "api/**/*.ts": {
       "includeFiles": "src/assets/images/**"
