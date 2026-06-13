@@ -118,7 +118,7 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
           <div className="flex gap-2 text-[10px] font-mono text-slate-400 mt-1">
             <span>Size: <strong className="text-slate-200">{trade.size.toLocaleString()} Units</strong></span>
             <span className="text-slate-605">•</span>
-            <span>ID: <strong className="text-slate-200">{id}</strong></span>
+            <span>ID: <strong className="text-slate-200">{trade.dbId || id}</strong></span>
           </div>
         </div>
         

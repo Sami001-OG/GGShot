@@ -3,20 +3,55 @@ import path from "path";
 import dns from "dns";
 import dotenv from "dotenv";
 import { MongoClient } from "mongodb";
+import mongoose from "mongoose";
 
 dotenv.config();
 
 // MongoDB setup
-const mongoUri = process.env.MONGODB_URI;
+let mongoUri = process.env.MONGODB_URI;
+// Correct encoding of the @ in the URI password if requested by the user previously
+if (mongoUri && mongoUri.includes("123sami@gg-shot")) {
+  mongoUri = "mongodb+srv://Sami:sami%40123sami@gg-shot.ybpg66p.mongodb.net/?appName=GG-Shot";
+}
+
 let db: any = null;
 
+const TradeSchema = new mongoose.Schema({
+  tradeId: { type: String, required: true, unique: true },
+  symbol: String,
+  direction: String,
+  entryPrice: Number,
+  exitPrice: Number,
+  pnlPercent: Number,
+  status: String,
+  timestamp: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+}, { collection: "daily_trades" });
+
+const TradeModel = mongoose.model("Trade", TradeSchema);
+
+const DailyCounterSchema = new mongoose.Schema({
+  dateKey: { type: String, required: true, unique: true },
+  count: { type: Number, default: 0 }
+}, { collection: "daily_counters" });
+
+const DailyCounterModel = mongoose.model("DailyCounter", DailyCounterSchema);
+
 if (mongoUri) {
+  // Original DB setup
   const client = new MongoClient(mongoUri);
   client.connect().then(() => {
     db = client.db("GG-Shot");
-    console.log("Connected to MongoDB successfully.");
+    console.log("Connected to MongoDB successfully via standard driver.");
   }).catch((err) => {
     console.error("MongoDB connection failed:", err);
+  });
+
+  // Mongoose setup
+  mongoose.connect(mongoUri, { dbName: "GG-Shot" }).then(() => {
+    console.log("Connected to Mongoose successfully for Trades tracking.");
+  }).catch(err => {
+    console.error("Mongoose connection failed:", err);
   });
 }
 
@@ -232,6 +267,113 @@ const app = express();
 app.use(express.json());
 
 // --- MONGODB STATE APIS ---
+app.post("/api/trades/record", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) return res.status(500).json({ error: "DB not ready" });
+  try {
+    const { localId, symbol, direction, entryPrice, exitPrice, pnlPercent, status } = req.body;
+    
+    const now = new Date();
+    const dd = String(now.getUTCDate()).padStart(2, '0');
+    const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const dateKey = `${dd}${mm}`;
+
+    // If it's a new trade (OPEN status), we generate a trade ID using the counter
+    let tradeRecord = undefined;
+    if (status === "OPEN" && localId) {
+       // Only increment the counter and create new if it doesn't already exist with this localId as a fallback logic
+       // Actually, to keep it simple, we generate a formal DB ID and return it
+       const counter = await DailyCounterModel.findOneAndUpdate(
+         { dateKey },
+         { $inc: { count: 1 } },
+         { new: true, upsert: true }
+       );
+       const paddedSeq = String(counter.count).padStart(2, '0');
+       const tradeId = `${dateKey}${paddedSeq}`;
+
+       tradeRecord = new TradeModel({
+         tradeId,
+         symbol,
+         direction,
+         entryPrice,
+         status,
+         pnlPercent: 0
+       });
+       await tradeRecord.save();
+       return res.json({ success: true, tradeId });
+    } else {
+       // Update an existing trade (for TP/SL closed trades)
+       // Expects the client to pass the assigned `dbId` in `req.body.dbId`
+       const dbId = req.body.dbId;
+       if (!dbId) return res.status(400).json({ error: "Missing dbId for update" });
+       
+       tradeRecord = await TradeModel.findOneAndUpdate(
+         { tradeId: dbId },
+         { 
+           status, 
+           exitPrice, 
+           pnlPercent, 
+           updatedAt: new Date() 
+         },
+         { new: true }
+       );
+       return res.json({ success: true, trade: tradeRecord });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint to manually trigger the daily 24h cron
+app.post("/api/trades/daily-report", async (req, res) => {
+  try {
+    const success = await processDailyReport();
+    res.json({ success });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function processDailyReport() {
+  if (mongoose.connection.readyState !== 1) return false;
+  try {
+    const trades = await TradeModel.find({});
+    if (trades.length === 0) {
+      await sendTelegramMessage("📊 <b>Daily Report:</b>\nNo trades were recorded in the last 24h.");
+      return true;
+    }
+
+    const won = trades.filter(t => t.pnlPercent > 0).length;
+    const lost = trades.filter(t => t.pnlPercent < 0).length;
+    const breakevenOrOpen = trades.length - won - lost;
+    
+    let totalPnl = 0;
+    trades.forEach(t => totalPnl += (t.pnlPercent || 0));
+
+    const msg = `📊 <b>Daily 24h Trade Report</b> 📊\n\n` +
+      `Total Signals/Trades: ${trades.length}\n` +
+      `✅ Win: ${won}\n` +
+      `❌ Loss: ${lost}\n` +
+      `⚪ Open/Breakeven: ${breakevenOrOpen}\n` +
+      `💰 Total Net PnL: ${totalPnl > 0 ? '+' : ''}${totalPnl.toFixed(2)}%\n\n` +
+      `<i>Database has been wiped for the next 24h cycle.</i>`;
+      
+    await sendTelegramMessage(msg);
+
+    // After 24h, a report from db will go through telegram and the db will be blank
+    await TradeModel.deleteMany({});
+    
+    return true;
+  } catch (error) {
+    console.error("Daily report failed", error);
+    return false;
+  }
+}
+
+// 24H cron interval
+setInterval(() => {
+  processDailyReport();
+}, 24 * 60 * 60 * 1000);
+
 app.get("/api/db/state", async (req, res) => {
   if (!db) return res.json({ error: "Database not connected" });
   try {
@@ -260,6 +402,9 @@ app.post("/api/db/state", async (req, res) => {
     res.status(500).json({ error: "Failed to save state to DB" });
   }
 });
+
+// Removed test-mongoose
+
 
 // --- AUTONOMOUS BACKEND CRON SCANNER TASK ---
 async function runMarketScan() {

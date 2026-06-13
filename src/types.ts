@@ -3,6 +3,7 @@ export type TradeStatus = 'ACTIVE' | 'WIN' | 'LOSS';
 
 export interface ActiveTrade {
   id: string;
+  dbId?: string;
   symbol: string;
   direction: TradeDirection;
   entry: number;

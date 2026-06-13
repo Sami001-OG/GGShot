@@ -20,7 +20,8 @@ import {
   Send,
   Check,
   Bell,
-  Search
+  Search,
+  Database
 } from 'lucide-react';
 import { ActiveTradeCard } from './components/ActiveTradeCard';
 import { DailyPerformance } from './components/DailyPerformance';
@@ -227,6 +228,18 @@ export default function App() {
     setTerminalLogs(prev => [`[${timestamp}] ${msg}`, ...prev].slice(0, 40));
   };
 
+  // Helper to persist trade closure to MongoDB
+  const persistTradeUpdate = (dbId: string | undefined, exitPrice: number, pnlPercent: number, status: string) => {
+    if (!dbId) return;
+    fetch("/api/trades/record", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        dbId, exitPrice, pnlPercent, status
+      })
+    }).catch(err => writeLog(`[DB UPDATE ERROR] Failed to close trade ${dbId}: ${err.message}`));
+  };
+
   // Master position update handler following high-fidelity PineScript specification
   const processTradeUpdate = (
     trade: ActiveTrade, 
@@ -239,6 +252,7 @@ export default function App() {
     let currentSize = trade.size;
     let realizedTps = [...(trade.realizedTps ?? [false, false, false, false])];
     let partialPnlRealized = trade.partialPnlRealized ?? 0;
+    const displayId = trade.dbId || trade.id;
 
     const config = COIN_CONFIGS[trade.symbol] || DEFAULT_CONFIG;
     const alloc = config.alloc;
@@ -275,9 +289,11 @@ export default function App() {
 
         writeLog(`[STOP LOSS HIT] ${trade.symbol} ${trade.direction} hit SL at ${formatPrice(slBound)}! Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`);
         
+        persistTradeUpdate(trade.dbId, slBound, finalPercent, 'LOSS');
+
         sendTelegramNotification(
           `🚨 <b>GG-SHOT Stop Loss Hit</b>\n` +
-          `🆔 <b>trade id:</b> ${trade.id}\n` +
+          `🆔 <b>trade id:</b> ${displayId}\n` +
           `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
           `📉 <b>Event:</b> Position hit Stop Loss bound\n` +
           `💵 <b>SL price:</b> ${formatPrice(slBound)}\n` +
@@ -318,9 +334,11 @@ export default function App() {
 
         writeLog(`[REVERSAL EXIT] ${trade.symbol} ${trade.direction} trend flipped! Exited remaining at ${formatPrice(currentPrice)}. Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`);
         
+        persistTradeUpdate(trade.dbId, currentPrice, finalPercent, status);
+
         sendTelegramNotification(
           `🔄 <b>GG-SHOT Trend Reversal Exit</b>\n` +
-          `🆔 <b>trade id:</b> ${trade.id}\n` +
+          `🆔 <b>trade id:</b> ${displayId}\n` +
           `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
           `⚠️ <b>Event:</b> Trend inverted. Safety scale-out executed.\n` +
           `💵 <b>Reversal Price:</b> ${formatPrice(currentPrice)}\n` +
@@ -361,7 +379,7 @@ export default function App() {
           
           sendTelegramNotification(
             `🎯 <b>GG-SHOT Take Profit Achieved!</b>\n` +
-            `🆔 <b>trade id:</b> ${trade.id}\n` +
+            `🆔 <b>trade id:</b> ${displayId}\n` +
             `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
             `📈 <b>Milestone:</b> Take Profit #${i+1} reached successfully! 🎉\n` +
             `📊 <b>Scale-out Weight:</b> ${alloc[i]}%\n` +
@@ -413,9 +431,11 @@ export default function App() {
 
         writeLog(`[TP4 COMPLETED] ${trade.symbol} target cycle achieved! Net PnL: +${finalPercent.toFixed(2)}%`);
         
+        persistTradeUpdate(trade.dbId, trade.tps[3], finalPercent, 'WIN');
+
         sendTelegramNotification(
           `🏆 <b>GG-SHOT Cycle Fully Achieved!</b>\n` +
-          `🆔 <b>trade id:</b> ${trade.id}\n` +
+          `🆔 <b>trade id:</b> ${displayId}\n` +
           `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
           `🏁 <b>Event:</b> Ultimate Take Profit #4 hit - full position realized!\n` +
           `💵 <b>Completion Price:</b> ${formatPrice(trade.tps[3])}\n` +
@@ -704,19 +724,44 @@ export default function App() {
                 const newTrade = spawnTradeOfCondition(coin, lastSignal, entry);
                 writeLog(`>>> SIGNAL COIN: ${coin} ${lastSignal} @ $${formatPrice(entry)} triggered on TrendLine inversion!`);
                 
-                sendTelegramNotification(
-                  `🤖 <b>New Trade Signal</b>\n\n` +
-                  `🆔 <b>trade id:</b> ${newTrade.id}\n` +
-                  `🪙 <b>symbol:</b> #${coin}USDT\n` +
-                  `📈 <b>direction:</b> ${newTrade.direction}\n` +
-                  `🎯 <b>tps:</b>\n` +
-                  `  TP1: $${formatPrice(newTrade.tps[0])}\n` +
-                  `  TP2: $${formatPrice(newTrade.tps[1])}\n` +
-                  `  TP3: $${formatPrice(newTrade.tps[2])}\n` +
-                  `  TP4: $${formatPrice(newTrade.tps[3])}\n` +
-                  `🛑 <b>sl:</b> $${formatPrice(newTrade.sl)}`,
-                  newTrade.direction
-                ).catch(() => {});
+                // Asynchronously register in Mongoose
+                fetch("/api/trades/record", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    localId: newTrade.id,
+                    symbol: newTrade.symbol,
+                    direction: newTrade.direction,
+                    entryPrice: newTrade.entry,
+                    status: "OPEN"
+                  })
+                })
+                .then(res => res.json())
+                .then(data => {
+                  if (data.success && data.tradeId) {
+                    newTrade.dbId = data.tradeId;
+                    
+                    // Now that we have the real DB ID (DDMMXXX), send via Telegram
+                    sendTelegramNotification(
+                      `🤖 <b>New Trade Signal</b>\n\n` +
+                      `🆔 <b>trade id:</b> ${newTrade.dbId}\n` +
+                      `🪙 <b>symbol:</b> #${coin}USDT\n` +
+                      `📈 <b>direction:</b> ${newTrade.direction}\n` +
+                      `🎯 <b>tps:</b>\n` +
+                      `  TP1: $${formatPrice(newTrade.tps[0])}\n` +
+                      `  TP2: $${formatPrice(newTrade.tps[1])}\n` +
+                      `  TP3: $${formatPrice(newTrade.tps[2])}\n` +
+                      `  TP4: $${formatPrice(newTrade.tps[3])}\n` +
+                      `🛑 <b>sl:</b> $${formatPrice(newTrade.sl)}`,
+                      newTrade.direction
+                    ).catch(() => {});
+
+                    // Make sure the active array gets updated with the dbId
+                    setActiveTrades(trades => trades.map(t => t.id === newTrade.id ? { ...t, dbId: newTrade.dbId } : t));
+                  }
+                })
+                .catch(err => writeLog(`[DB ERROR] Failed to record trade ${newTrade.id}: ${err.message}`));
+
                 return [...nextActive, newTrade];
               });
             }
@@ -840,6 +885,27 @@ export default function App() {
              </div>
 
              <div className="flex items-center gap-3 font-mono">
+                 <button 
+                    onClick={async () => {
+                      writeLog("[24H REPORT] Requesting Mongoose to compile 24h trade report via Telegram...");
+                      try {
+                        const res = await fetch("/api/trades/daily-report", { method: "POST" });
+                        const data = await res.json();
+                        if (data.success) {
+                          writeLog(`[24H REPORT SUCCESS] Daily Telegram report triggered, DB wiped.`);
+                        } else {
+                          writeLog(`[24H REPORT ERROR] Failed to process daily report`);
+                        }
+                      } catch (err: any) {
+                        writeLog(`[24H REPORT EXCEPTION] ${err.message}`);
+                      }
+                    }}
+                    className={cn("flex items-center gap-2 px-3 py-1.5 rounded-[4px] font-bold text-[9px] uppercase tracking-widest transition-all border", "bg-indigo-500/5 text-indigo-400 border-indigo-500/20 hover:bg-indigo-500/10")}
+                 >
+                    <Database size={10} strokeWidth={3}/>
+                    Trigger Daily Report
+                 </button>
+
                  <button 
                     onClick={() => setIsPlaying(!isPlaying)}
                     className={cn("flex items-center gap-2 px-3 py-1.5 rounded-[4px] font-bold text-[9px] uppercase tracking-widest transition-all border",
