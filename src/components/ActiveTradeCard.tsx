@@ -34,7 +34,8 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
 
   // Determine reached status for each target
   const checkTargetReached = (val: number) => {
-    return isLong ? currentPrice >= val : currentPrice <= val;
+    const isValidMove = isLong ? currentPrice > entry * 1.001 : currentPrice < entry * 0.999;
+    return isValidMove && (isLong ? currentPrice >= val : currentPrice <= val);
   };
 
   const getPercentageOf = (price: number) => {

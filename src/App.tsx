@@ -72,6 +72,7 @@ export default function App() {
   // Technical Algorithmic Defence Gates Toggles (Enabled by default)
   const [filterAdx, setFilterAdx] = useState(true);
   const [filterMtf, setFilterMtf] = useState(true);
+  const [filterEma, setFilterEma] = useState(true);
   const [filterVolume, setFilterVolume] = useState(true);
   const [filterFunding, setFilterFunding] = useState(true);
   const [filterLiquidity, setFilterLiquidity] = useState(true);
@@ -115,9 +116,48 @@ export default function App() {
       .catch(() => {});
   };
 
+  const loadedStateDb = useRef<boolean>(false);
+
   useEffect(() => {
     reloadTelegramStatus();
+    
+    // Load state from DB
+    fetch('/api/db/state')
+      .then(res => res.json())
+      .then(data => {
+        if (!data.error) {
+          if (data.activeTrades) setActiveTrades(data.activeTrades);
+          if (data.closedTrades) setClosedTrades(data.closedTrades);
+          if (data.stats) setStats(data.stats);
+          if (data.logs) setTerminalLogs(data.logs);
+        }
+        loadedStateDb.current = true;
+      })
+      .catch((err) => {
+        console.error("Failed to load DB state:", err);
+        loadedStateDb.current = true;
+      });
   }, []);
+
+  // Sync state to DB on change
+  useEffect(() => {
+    if (!loadedStateDb.current) return;
+    
+    const timeout = setTimeout(() => {
+      fetch('/api/db/state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          activeTrades,
+          closedTrades,
+          stats,
+          logs: terminalLogs
+        })
+      }).catch(err => console.error("Failed to save DB state:", err));
+    }, 1000); // 1-second debounce
+    
+    return () => clearTimeout(timeout);
+  }, [activeTrades, closedTrades, stats, terminalLogs]);
 
   const saveTelegramConfig = (enabled: boolean) => {
     setTgEnabled(enabled);
@@ -300,8 +340,11 @@ export default function App() {
 
       const targetPrice = trade.tps[i];
       const hitTarget = isLong ? currentPrice >= targetPrice : currentPrice <= targetPrice;
+      
+      // Strict mathematical constraint: require price to genuinely advance into profit
+      const isValidMove = isLong ? currentPrice > entry * 1.001 : currentPrice < entry * 0.999;
 
-      if (hitTarget) {
+      if (hitTarget && isValidMove) {
         realizedTps[i] = true;
         const partShare = alloc[i] / 100;
         const partSize = initialSize * partShare;
@@ -578,6 +621,7 @@ export default function App() {
               const mtfTrend = res.mtf4hITrend ?? 0;
               const funding = res.fundingRate ?? 0;
               const liquidity = res.volume24hUsdt ?? 20000000;
+              const ema200val = res.ema200_4h?.[res.ema200_4h.length - 2] ?? entry;
 
               // Filter 1: ADX (strong trend validation)
               if (filterAdx && adxVal <= 25) {
@@ -597,7 +641,19 @@ export default function App() {
                 }
               }
 
-              // Filter 3: Volume Participation Breakout
+              // Filter 3: 4H EMA 200 Trend Line
+              if (filterEma) {
+                if (lastSignal === 'LONG' && entry <= ema200val) {
+                  writeLog(`[FILTERED OUT] ${coin} LONG Signal at $${formatPrice(entry)} rejected: Price <= 4H EMA 200 (${formatPrice(ema200val)})`);
+                  continue;
+                }
+                if (lastSignal === 'SHORT' && entry >= ema200val) {
+                  writeLog(`[FILTERED OUT] ${coin} SHORT Signal at $${formatPrice(entry)} rejected: Price >= 4H EMA 200 (${formatPrice(ema200val)})`);
+                  continue;
+                }
+              }
+
+              // Filter 4: Volume Participation Breakout
               if (filterVolume && volRatio <= 1.5) {
                 writeLog(`[FILTERED OUT] ${coin} ${lastSignal} Signal at $${formatPrice(entry)} rejected: Breakout Volume ratio ${volRatio.toFixed(2)}x <= 1.5x`);
                 continue;
@@ -1047,9 +1103,10 @@ export default function App() {
                        <div className="flex flex-col gap-2 z-10">
                           <GateSwitch filterVar={filterAdx} setter={setFilterAdx} label="1. ADX Volatility" value={ggResult?.adx[ggResult.adx.length - 1]?.toFixed(1) ?? 'N/A'} required="> 25.0" pass={filterAdx ? ((ggResult?.adx[ggResult.adx.length - 1] ?? 0) > 25) : null} />
                           <GateSwitch filterVar={filterMtf} setter={setFilterMtf} label="2. 4H Multi-Timeframe" value={ggResult?.mtf4hITrend === 1 ? 'BULL' : ggResult?.mtf4hITrend === -1 ? 'BEAR' : 'N/A'} required="MATCH" pass={filterMtf ? (ggResult && (ggResult.mtf4hITrend === (ggResult.iTrend[ggResult.iTrend.length - 1] || 0))) : null} />
-                          <GateSwitch filterVar={filterVolume} setter={setFilterVolume} label="3. Volume Particip." value={`${ggResult?.volumeRatio?.toFixed(2) ?? '1.00'}x`} required="> 1.50x" pass={filterVolume ? ((ggResult?.volumeRatio ?? 0) > 1.5) : null} />
-                          <GateSwitch filterVar={filterFunding} setter={setFilterFunding} label="4. Funding Rate" value={`${(ggResult?.fundingRate ?? 0).toFixed(4)}%`} required="< 0.05%" pass={filterFunding ? (ggResult && !( (ggResult.iTrend[ggResult.iTrend.length - 1] === 1 && ggResult.fundingRate >= 0.05) || (ggResult.iTrend[ggResult.iTrend.length - 1] === -1 && ggResult.fundingRate <= -0.05) )) : null} />
-                          <GateSwitch filterVar={filterLiquidity} setter={setFilterLiquidity} label="5. Volume Profile" value={`$${((ggResult?.volume24hUsdt ?? 0) / 1000000).toFixed(1)}M`} required="> $30M" pass={filterLiquidity ? ((ggResult?.volume24hUsdt ?? 0) >= 30000000) : null} />
+                          <GateSwitch filterVar={filterEma} setter={setFilterEma} label="3. 4H EMA 200" value={ggResult?.ema200_4h?.[ggResult.ema200_4h.length - 1] ? `$${formatPrice(ggResult.ema200_4h[ggResult.ema200_4h.length - 1]!)}` : 'N/A'} required="TREND" pass={filterEma ? (ggResult && coinsCandles[selectedCoin]?.[coinsCandles[selectedCoin].length - 1]?.close ? (ggResult.iTrend[ggResult.iTrend.length - 1] === 1 ? coinsCandles[selectedCoin][coinsCandles[selectedCoin].length - 1].close > (ggResult.ema200_4h[ggResult.ema200_4h.length - 1] ?? 0) : coinsCandles[selectedCoin][coinsCandles[selectedCoin].length - 1].close < Math.max(0.0001, ggResult.ema200_4h[ggResult.ema200_4h.length - 1] ?? Infinity)) : null) : null} />
+                          <GateSwitch filterVar={filterVolume} setter={setFilterVolume} label="4. Volume Particip." value={`${ggResult?.volumeRatio?.toFixed(2) ?? '1.00'}x`} required="> 1.50x" pass={filterVolume ? ((ggResult?.volumeRatio ?? 0) > 1.5) : null} />
+                          <GateSwitch filterVar={filterFunding} setter={setFilterFunding} label="5. Funding Rate" value={`${(ggResult?.fundingRate ?? 0).toFixed(4)}%`} required="< 0.05%" pass={filterFunding ? (ggResult && !( (ggResult.iTrend[ggResult.iTrend.length - 1] === 1 && ggResult.fundingRate >= 0.05) || (ggResult.iTrend[ggResult.iTrend.length - 1] === -1 && ggResult.fundingRate <= -0.05) )) : null} />
+                          <GateSwitch filterVar={filterLiquidity} setter={setFilterLiquidity} label="6. Volume Profile" value={`$${((ggResult?.volume24hUsdt ?? 0) / 1000000).toFixed(1)}M`} required="> $30M" pass={filterLiquidity ? ((ggResult?.volume24hUsdt ?? 0) >= 30000000) : null} />
                        </div>
                    </div>
 

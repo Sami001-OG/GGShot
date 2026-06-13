@@ -2,6 +2,23 @@ import express from "express";
 import path from "path";
 import dns from "dns";
 import dotenv from "dotenv";
+import { MongoClient } from "mongodb";
+
+dotenv.config();
+
+// MongoDB setup
+const mongoUri = process.env.MONGODB_URI;
+let db: any = null;
+
+if (mongoUri) {
+  const client = new MongoClient(mongoUri);
+  client.connect().then(() => {
+    db = client.db("GG-Shot");
+    console.log("Connected to MongoDB successfully.");
+  }).catch((err) => {
+    console.error("MongoDB connection failed:", err);
+  });
+}
 
 // Provide backend fallback exports matching what indicators.ts does
 const MAJOR_FUTURES = [
@@ -18,6 +35,24 @@ function sma(data: number[], period: number): (number | null)[] {
   for (let i = period; i < data.length; i++) {
     s += data[i] - data[i - period];
     result.push(s / period);
+  }
+  return result;
+}
+
+function ema(data: number[], period: number): (number | null)[] {
+  if (data.length < period) return Array(data.length).fill(null);
+  const result: (number | null)[] = Array(period - 1).fill(null);
+  const k = 2 / (period + 1);
+  let smaSum = 0;
+  for (let i = 0; i < period; i++) {
+    smaSum += data[i];
+  }
+  let prevEma = smaSum / period;
+  result.push(prevEma);
+  
+  for (let i = period; i < data.length; i++) {
+    prevEma = (data[i] - prevEma) * k + prevEma;
+    result.push(prevEma);
   }
   return result;
 }
@@ -147,8 +182,9 @@ function calculateGGShotServer(candles: any[], bbPeriod: number, bbDev: number) 
   }
 
   const { adx } = calculateADX(candles);
+  const ema200_4h = ema(close, 800);
 
-  return { mid, upper, lower, bbSignals, trendLine, iTrend, signals, adx };
+  return { mid, upper, lower, bbSignals, trendLine, iTrend, signals, adx, ema200_4h };
 }
 
 async function sendTelegramMessage(message: string, imageType?: "LONG"|"SHORT") {
@@ -195,17 +231,48 @@ dns.setDefaultResultOrder("ipv4first");
 const app = express();
 app.use(express.json());
 
-// --- AUTONOMOUS BACKEND CRON SCANNER ---
-app.get("/api/cron", async (req, res) => {
+// --- MONGODB STATE APIS ---
+app.get("/api/db/state", async (req, res) => {
+  if (!db) return res.json({ error: "Database not connected" });
+  try {
+    const stateRecord = await db.collection("system_state").findOne({ id: "main" });
+    if (stateRecord) {
+      res.json(stateRecord);
+    } else {
+      res.json({ activeTrades: [], closedTrades: [], stats: { balance: 10000, won: 0, lost: 0, totalPnl: 0 }, logs: [] });
+    }
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch state from DB" });
+  }
+});
+
+app.post("/api/db/state", async (req, res) => {
+  if (!db) return res.json({ error: "Database not connected" });
+  try {
+    const { activeTrades, closedTrades, stats, logs } = req.body;
+    await db.collection("system_state").updateOne(
+      { id: "main" },
+      { $set: { activeTrades, closedTrades, stats, logs, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to save state to DB" });
+  }
+});
+
+// --- AUTONOMOUS BACKEND CRON SCANNER TASK ---
+async function runMarketScan() {
+  console.log("[CRON] Starting background market scan...");
   try {
     let triggeredSignals = 0;
     
-    // We only process the top 5 to avoid API limits on free tiers, or run concurrently
+    // We only process the top 15 to avoid API limits on free tiers, or run concurrently
     // Using MAJOR_FUTURES slice, processing all in parallel
     const processPromises = MAJOR_FUTURES.slice(0, 15).map(async (coin) => {
       try {
         const symbol = `${coin}USDT`;
-        const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=100`, {
+        const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
           signal: AbortSignal.timeout(8000)
         });
         if (!r.ok) return;
@@ -232,22 +299,47 @@ app.get("/api/cron", async (req, res) => {
         const targetIdx = candles.length - 2;
         const signal = resList.signals[targetIdx];
         const adxVal = resList.adx[targetIdx] ?? 0;
+        const ema200val = resList.ema200_4h[targetIdx] ?? candles[targetIdx].close;
 
         if (signal) {
           // Strong filter rejection: ADX must be > 25 for strong trend
           if (adxVal > 25) {
-            triggeredSignals++;
             const closePrice = candles[targetIdx].close;
-            const msg = `⚡ <b>SYSTEM SCANNER (Autonomous Vercel Engine)</b>\n\n🎯 <b>${coin}USDT</b> | <b>${signal} TRIGGERED</b>\n\n💰 Entry Price: ${closePrice}\n📊 ADX: ${adxVal.toFixed(1)}${adxVal > 25 ? ' (STRONG TREND)' : ''}\n\n<i>This signal was processed securely via backend cron task without frontend dependency.</i>`;
-            await sendTelegramMessage(msg, signal);
+            // 4H EMA 200 filter check
+            if ((signal === 'LONG' && closePrice > ema200val) || (signal === 'SHORT' && closePrice < ema200val)) {
+              triggeredSignals++;
+              const msg = `⚡ <b>SYSTEM SCANNER (Autonomous Engine)</b>\n\n🎯 <b>${coin}USDT</b> | <b>${signal} TRIGGERED</b>\n\n💰 Entry Price: ${closePrice}\n📊 ADX: ${adxVal.toFixed(1)}${adxVal > 25 ? ' (STRONG TREND)' : ''}\n📈 4H EMA 200 Trend Check: PASS\n\n<i>This signal was processed securely via background task without frontend.</i>`;
+              await sendTelegramMessage(msg, signal);
+            }
           }
         }
       } catch(e) {}
     });
 
     await Promise.all(processPromises);
+    console.log(`[CRON] Background market scan complete. Triggered ${triggeredSignals} valid signals.`);
+    return triggeredSignals;
+  } catch(e) {
+    console.error("[CRON] Background scan failed:", e);
+    return 0;
+  }
+}
 
-    res.json({ success: true, message: `Cron cycle complete. Generated ${triggeredSignals} valid signals.` });
+// Start the autonomous looping engine running every 15 minutes (900000 ms)
+const AUTONOMOUS_SCAN_INTERVAL = 15 * 60 * 1000;
+setInterval(() => {
+  runMarketScan();
+}, AUTONOMOUS_SCAN_INTERVAL);
+// Initial scan on startup
+setTimeout(() => {
+  runMarketScan();
+}, 10000); // 10 seconds after boot!
+
+// Keep the external route available just in case they want a manual external trigger (Cron-job.org)
+app.get("/api/cron", async (req, res) => {
+  try {
+    const triggered = await runMarketScan();
+    res.json({ success: true, message: `Cron cycle complete. Generated ${triggered} valid signals.` });
   } catch (err: any) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -326,7 +418,7 @@ app.get("/api/binance/metrics/:coin", async (req, res) => {
     const symbol = `${coin}USDT`;
     const baseUrl = "https://fapi.binance.com";
 
-    const r = await fetch(`${baseUrl}/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=300`, {
+    const r = await fetch(`${baseUrl}/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
       signal: AbortSignal.timeout(6000)
     });
 

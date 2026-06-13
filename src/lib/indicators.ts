@@ -37,6 +37,7 @@ export interface IndicatorResult {
   mtf4hITrend: number;       // Latest 4H trend direction (1 = BULL, -1 = BEAR, 0 = NEUTRAL)
   fundingRate: number;      // Current Funding Rate in % (e.g. 0.015%)
   volume24hUsdt: number;    // Simulated or actual 24H volume of asset in USDT
+  ema200_4h: (number | null)[];
 }
 
 // 2b. Standard Deviation (STDEV)
@@ -64,6 +65,25 @@ export function sma(data: number[], period: number): (number | null)[] {
   for (let i = period; i < data.length; i++) {
     s += data[i] - data[i - period];
     result.push(s / period);
+  }
+  return result;
+}
+
+// 2b. Exponential Moving Average (EMA)
+export function ema(data: number[], period: number): (number | null)[] {
+  if (data.length < period) return Array(data.length).fill(null);
+  const result: (number | null)[] = Array(period - 1).fill(null);
+  const k = 2 / (period + 1);
+  let smaSum = 0;
+  for (let i = 0; i < period; i++) {
+    smaSum += data[i];
+  }
+  let prevEma = smaSum / period;
+  result.push(prevEma);
+  
+  for (let i = period; i < data.length; i++) {
+    prevEma = (data[i] - prevEma) * k + prevEma;
+    result.push(prevEma);
   }
   return result;
 }
@@ -403,6 +423,9 @@ export function calculateGGShot(
   const fundingRate = getCoinFundingRate(symbol, currentBias);
   const volume24hUsdt = baseVol24h * (0.9 + Math.sin(Date.now() / 100000) * 0.1);
 
+  // 5. 4H EMA 200 (Equivalent to 800-period EMA on 1H chart)
+  const ema200_4h = ema(closes, 800);
+
   return {
     mid,
     upper,
@@ -417,5 +440,6 @@ export function calculateGGShot(
     mtf4hITrend,
     fundingRate,
     volume24hUsdt,
+    ema200_4h,
   };
 }
