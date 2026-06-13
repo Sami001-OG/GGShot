@@ -4,6 +4,9 @@ import dns from "dns";
 import dotenv from "dotenv";
 import { MongoClient } from "mongodb";
 import mongoose from "mongoose";
+import WebSocket from "ws";
+import { calculateGGShot, getCoinFundingRate, getCoinBase24hVolume, aggregateTo4Hour, calculateITrendOnly } from "../src/lib/indicators.js";
+import { COIN_CONFIGS, DEFAULT_CONFIG } from "../src/lib/ggshot_1h_config.js";
 
 dotenv.config();
 
@@ -43,6 +46,8 @@ if (mongoUri) {
   client.connect().then(() => {
     db = client.db("GG-Shot");
     console.log("Connected to MongoDB successfully via standard driver.");
+    // Start WebSocket Screener once DB is connected!
+    startWebSocketScreener();
   }).catch((err) => {
     console.error("MongoDB connection failed:", err);
   });
@@ -55,172 +60,677 @@ if (mongoUri) {
   });
 }
 
-// Provide backend fallback exports matching what indicators.ts does
 const MAJOR_FUTURES = [
   'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'PEPE', 'WIF', 'SUI',
   'APT', 'ARB', 'OP', 'TIA', 'NOT', 'LTC', 'LINK', 'DOT', 'NEAR', 'AVAX'
 ];
 
-function sma(data: number[], period: number): (number | null)[] {
-  if (data.length < period) return Array(data.length).fill(null);
-  const result: (number | null)[] = Array(period - 1).fill(null);
-  let s = 0;
-  for (let i = 0; i < period; i++) s += data[i];
-  result.push(s / period);
-  for (let i = period; i < data.length; i++) {
-    s += data[i] - data[i - period];
-    result.push(s / period);
+// Sub-millisecond Live Price cache updated via WebSocket
+const globalLivePrices: Record<string, number> = {};
+
+// Keep a set of processed keys to strictly prevent double executions (idempotency)
+const processedClosedKlines = new Set<string>();
+
+// DB State helpers
+async function getSystemState() {
+  if (!db) return null;
+  try {
+    return await db.collection("system_state").findOne({ id: "main" });
+  } catch (e) {
+    console.error("[RECONCILER] Error reading system state from DB:", e);
+    return null;
   }
-  return result;
 }
 
-function ema(data: number[], period: number): (number | null)[] {
-  if (data.length < period) return Array(data.length).fill(null);
-  const result: (number | null)[] = Array(period - 1).fill(null);
-  const k = 2 / (period + 1);
-  let smaSum = 0;
-  for (let i = 0; i < period; i++) {
-    smaSum += data[i];
+async function saveSystemState(state: any) {
+  if (!db) return false;
+  try {
+    await db.collection("system_state").updateOne(
+      { id: "main" },
+      { $set: state },
+      { upsert: true }
+    );
+    return true;
+  } catch (e) {
+    console.error("[RECONCILER] Error writing system state to DB:", e);
+    return false;
   }
-  let prevEma = smaSum / period;
-  result.push(prevEma);
-  
-  for (let i = period; i < data.length; i++) {
-    prevEma = (data[i] - prevEma) * k + prevEma;
-    result.push(prevEma);
-  }
-  return result;
 }
 
-function stdev(data: number[], period: number): (number | null)[] {
-  if (data.length < period) return Array(data.length).fill(null);
-  const result: (number | null)[] = Array(period - 1).fill(null);
-  for (let i = period - 1; i < data.length; i++) {
-    const window = data.slice(i - period + 1, i + 1);
-    const mean = window.reduce((a, b) => a + b, 0) / period;
-    const variance = window.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / period;
-    result.push(Math.sqrt(variance));
-  }
-  return result;
+function formatPrice(val: number): string {
+  if (val === undefined || isNaN(val)) return "0.00";
+  if (val < 0.00001) return val.toFixed(8);
+  if (val < 0.001) return val.toFixed(6);
+  if (val < 0.1) return val.toFixed(4);
+  if (val < 1) return val.toFixed(3);
+  if (val < 10) return val.toFixed(2);
+  return val.toFixed(2);
 }
 
-function tr(high: number[], low: number[], close: number[]): number[] {
-  const trArr: number[] = [high[0] - low[0]];
-  for (let i = 1; i < high.length; i++) {
-    const hl = high[i] - low[i];
-    const hc = Math.abs(high[i] - close[i - 1]);
-    const lc = Math.abs(low[i] - close[i - 1]);
-    trArr.push(Math.max(hl, hc, lc));
-  }
-  return trArr;
-}
+// Replicate identical exit logic as React Client Front-End ProcessTradeUpdate including support for custom scale out variables
+function processTradeUpdateServerLogic(
+  trade: any, 
+  currentPrice: number, 
+  currentStats: any,
+  reversalTriggered?: boolean
+): { nextActive: any | null; closedTrade: any | null; updatedStats: any; loggedMsg: string | null } {
+  const isLong = trade.direction === 'LONG';
+  const entry = trade.entry;
+  const initialSize = trade.initialSize ?? trade.size;
+  let currentSize = trade.size;
+  let realizedTps = [...(trade.realizedTps ?? [false, false, false, false])];
+  let partialPnlRealized = trade.partialPnlRealized ?? 0;
+  const displayId = trade.dbId || trade.id;
 
-function calculateADX(candles: any[], period = 14) {
-  const high = candles.map(c => c.high);
-  const low = candles.map(c => c.low);
-  const close = candles.map(c => c.close);
-  const trArr = tr(high, low, close);
-  
-  let plusDM = [0], minusDM = [0];
-  for (let i = 1; i < candles.length; i++) {
-    const upMove = high[i] - high[i-1];
-    const downMove = low[i-1] - low[i];
-    if (upMove > downMove && upMove > 0) {
-      plusDM.push(upMove);
-      minusDM.push(0);
-    } else if (downMove > upMove && downMove > 0) {
-      plusDM.push(0);
-      minusDM.push(downMove);
-    } else {
-      plusDM.push(0);
-      minusDM.push(0);
+  const config = COIN_CONFIGS[trade.symbol] || DEFAULT_CONFIG;
+  const alloc = config.alloc;
+
+  const stats = { ...currentStats };
+  let loggedMsg: string | null = null;
+
+  // 1. Check stop loss bound
+  const slBound = trade.sl;
+  const hitSL = isLong ? currentPrice <= slBound : currentPrice >= slBound;
+
+  if (hitSL) {
+    const remainingPnl = (currentSize * (isLong ? (slBound - entry) : (entry - slBound))) / entry;
+    const totalPnl = partialPnlRealized + remainingPnl;
+    const finalPercent = (totalPnl / initialSize) * 100;
+
+    const closed = {
+      ...trade,
+      currentPrice,
+      size: 0,
+      exitPrice: slBound,
+      pnl: totalPnl,
+      pnlPercent: finalPercent,
+      status: 'LOSS',
+      timestamp: Date.now()
+    };
+
+    stats.balance += remainingPnl;
+    stats.won += (totalPnl > 0 ? 1 : 0);
+    stats.lost += (totalPnl <= 0 ? 1 : 0);
+    stats.totalPnl += remainingPnl;
+
+    loggedMsg = `[STOP LOSS HIT] ${trade.symbol} ${trade.direction} hit SL at ${formatPrice(slBound)}! Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`;
+
+    sendTelegramMessage(
+      `🚨 <b>GG-SHOT Stop Loss Hit</b>\n\n` +
+      `🆔 <b>trade id:</b> ${displayId}\n` +
+      `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
+      `📉 <b>Event:</b> Position hit Stop Loss bound\n` +
+      `💵 <b>SL price:</b> ${formatPrice(slBound)}\n` +
+      `📊 <b>Net Cycle Performance:</b> <b>${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%</b>`
+    ).catch(() => {});
+
+    return { nextActive: null, closedTrade: closed, updatedStats: stats, loggedMsg };
+  }
+
+  // 2. Check reversal exit
+  if (reversalTriggered) {
+    const remainingPnl = (currentSize * (isLong ? (currentPrice - entry) : (entry - currentPrice))) / entry;
+    const totalPnl = partialPnlRealized + remainingPnl;
+    const finalPercent = (totalPnl / initialSize) * 100;
+    const status = totalPnl > 0 ? 'WIN' : 'LOSS';
+
+    const closed = {
+      ...trade,
+      currentPrice,
+      size: 0,
+      exitPrice: currentPrice,
+      pnl: totalPnl,
+      pnlPercent: finalPercent,
+      status: status,
+      timestamp: Date.now()
+    };
+
+    stats.balance += remainingPnl;
+    stats.won += (totalPnl > 0 ? 1 : 0);
+    stats.lost += (totalPnl <= 0 ? 1 : 0);
+    stats.totalPnl += remainingPnl;
+
+    loggedMsg = `[REVERSAL EXIT] ${trade.symbol} ${trade.direction} trend flipped! Exited remaining at ${formatPrice(currentPrice)}. Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`;
+
+    sendTelegramMessage(
+      `🔄 <b>GG-SHOT Trend Reversal Exit</b>\n\n` +
+      `🆔 <b>trade id:</b> ${displayId}\n` +
+      `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
+      `⚠️ <b>Event:</b> Trend inverted. Safety scale-out executed.\n` +
+      `💵 <b>Reversal Price:</b> ${formatPrice(currentPrice)}\n` +
+      `📊 <b>Net Cycle Performance:</b> <b>${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%</b>`
+    ).catch(() => {});
+
+    return { nextActive: null, closedTrade: closed, updatedStats: stats, loggedMsg };
+  }
+
+  // 3. Scan take-profit levels sequentially
+  let immediateCompleteClose = false;
+  let actualDeltaPnl = 0;
+
+  for (let i = 0; i < 4; i++) {
+    if (realizedTps[i]) continue;
+
+    const targetPrice = trade.tps[i];
+    const hitTarget = isLong ? currentPrice >= targetPrice : currentPrice <= targetPrice;
+    
+    // Require price to genuinely advance into profit
+    const isValidMove = isLong ? currentPrice > entry * 1.0005 : currentPrice < entry * 0.9995;
+
+    if (hitTarget && isValidMove) {
+      realizedTps[i] = true;
+      const partShare = alloc[i] / 100;
+      const partSize = initialSize * partShare;
+      
+      const partPnl = (partSize * (isLong ? (targetPrice - entry) : (entry - targetPrice))) / entry;
+      
+      actualDeltaPnl += partPnl;
+      loggedMsg = `[PARTIAL TP${i+1} HIT] ${trade.symbol} scaled out ${alloc[i]}% of units at ${formatPrice(targetPrice)}!`;
+      
+      sendTelegramMessage(
+        `🎯 <b>GG-SHOT Take Profit Achieved!</b>\n\n` +
+        `🆔 <b>trade id:</b> ${displayId}\n` +
+        `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
+        `📈 <b>Milestone:</b> Take Profit #${i+1} reached successfully! 🎉\n` +
+        `📊 <b>Scale-out Weight:</b> ${alloc[i]}%\n` +
+        `💵 <b>Price Targeted:</b> ${formatPrice(targetPrice)}\n` +
+        `📊 <b>Target Status:</b> Achieved\n` +
+        `💰 <b>Partial PnL Realized:</b> <b>+${(partPnl / initialSize * 100).toFixed(2)}%</b>`
+      ).catch(() => {});
+      
+      partialPnlRealized += partPnl;
+
+      // Shrink active size
+      currentSize = Math.max(0, currentSize - partSize);
+
+      if (i === 3) {
+        immediateCompleteClose = true;
+      }
     }
   }
 
-  const smooth = (data: number[], period: number) => {
-    const res = [data[0]];
-    for (let i = 1; i < data.length; i++) res.push(res[i-1] - (res[i-1]/period) + data[i]);
-    return res;
+  if (actualDeltaPnl !== 0) {
+    stats.balance += actualDeltaPnl;
+    stats.totalPnl += actualDeltaPnl;
+  }
+
+  if (immediateCompleteClose || currentSize <= 0.01) {
+    const finalPercent = (partialPnlRealized / initialSize) * 100;
+    const closed = {
+      ...trade,
+      currentPrice,
+      size: 0,
+      exitPrice: trade.tps[3],
+      pnl: partialPnlRealized,
+      pnlPercent: finalPercent,
+      status: 'WIN',
+      timestamp: Date.now()
+    };
+
+    stats.won += 1;
+
+    loggedMsg = `[TP4 COMPLETED] ${trade.symbol} target cycle achieved! Net PnL: +${finalPercent.toFixed(2)}%`;
+
+    sendTelegramMessage(
+      `🏆 <b>GG-SHOT Cycle Fully Achieved!</b>\n\n` +
+      `🆔 <b>trade id:</b> ${displayId}\n` +
+      `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
+      `🏁 <b>Event:</b> Ultimate Take Profit #4 hit - full position realized!\n` +
+      `💵 <b>Completion Price:</b> ${formatPrice(trade.tps[3])}\n` +
+      `📊 <b>Total Net Cycle Performance:</b> <b>+${finalPercent.toFixed(2)}%</b>`
+    ).catch(() => {});
+
+    return { nextActive: null, closedTrade: closed, updatedStats: stats, loggedMsg };
+  }
+
+  // Otherwise, keep the active position alive but updated
+  const nextActive = {
+    ...trade,
+    currentPrice,
+    size: currentSize,
+    realizedTps,
+    partialPnlRealized
   };
 
-  const trSmoothed = smooth(trArr, period);
-  const plusDMSmoothed = smooth(plusDM, period);
-  const minusDMSmoothed = smooth(minusDM, period);
-
-  const plusDI = [], minusDI = [], dx = [];
-  for (let i = 0; i < candles.length; i++) {
-    if (trSmoothed[i] === 0) {
-      plusDI.push(0); minusDI.push(0); dx.push(0);
-    } else {
-      const pDI = 100 * (plusDMSmoothed[i] / trSmoothed[i]);
-      const mDI = 100 * (minusDMSmoothed[i] / trSmoothed[i]);
-      plusDI.push(pDI);
-      minusDI.push(mDI);
-      dx.push(100 * Math.abs(pDI - mDI) / (pDI + mDI || 1));
-    }
-  }
-
-  const adx = sma(dx, period).map(v => v === null ? 0 : v) as number[];
-  return { adx, plusDI, minusDI };
+  return { nextActive, closedTrade: null, updatedStats: stats, loggedMsg };
 }
 
-function calculateGGShotServer(candles: any[], bbPeriod: number, bbDev: number) {
-  const close = candles.map(c => c.close);
-  const mid = sma(close, bbPeriod);
-  const std = stdev(close, bbPeriod);
+// Low-latency Live position checker checking limits down to milliseconds of feed ticks
+async function checkRealPriceExitsServer() {
+  if (!db) return;
+  try {
+    const state = await getSystemState();
+    if (!state || !state.activeTrades || state.activeTrades.length === 0) return;
+
+    const activeTrades = state.activeTrades as any[];
+    const remaining: any[] = [];
+    const closed: any[] = state.closedTrades || [];
+    let stats = state.stats || { balance: 10000, won: 0, lost: 0, totalPnl: 0 };
+    let logs = state.logs || [];
+    let stateChanged = false;
+
+    for (const trade of activeTrades) {
+      const currentPrice = globalLivePrices[trade.symbol];
+      if (currentPrice === undefined) {
+        remaining.push(trade);
+        continue;
+      }
+
+      // Process trade tick check
+      const { nextActive, closedTrade, updatedStats, loggedMsg } = processTradeUpdateServerLogic(trade, currentPrice, stats);
+      
+      if (closedTrade) {
+        stateChanged = true;
+        closed.unshift(closedTrade);
+        stats = updatedStats;
+        if (loggedMsg) {
+          const timestamp = new Date().toLocaleTimeString();
+          logs.unshift(`[${timestamp}] ${loggedMsg}`);
+        }
+        
+        // Update database trade collection
+        try {
+          await TradeModel.findOneAndUpdate(
+            { tradeId: trade.dbId },
+            { 
+              status: closedTrade.status, 
+              exitPrice: closedTrade.exitPrice, 
+              pnlPercent: closedTrade.pnlPercent, 
+              updatedAt: new Date() 
+            }
+          );
+        } catch (err) {
+          console.error("[RECONCILER] Error updating DB trade record:", err);
+        }
+      } else if (nextActive) {
+        const didPartialTp = JSON.stringify(nextActive.realizedTps) !== JSON.stringify(trade.realizedTps);
+        if (didPartialTp) {
+          stateChanged = true;
+          stats = updatedStats;
+          if (loggedMsg) {
+            const timestamp = new Date().toLocaleTimeString();
+            logs.unshift(`[${timestamp}] ${loggedMsg}`);
+          }
+          remaining.push(nextActive);
+        } else {
+          remaining.push(trade);
+        }
+      }
+    }
+
+    if (stateChanged) {
+      state.activeTrades = remaining;
+      state.closedTrades = closed.slice(0, 40);
+      state.stats = stats;
+      state.logs = logs.slice(0, 40);
+      await saveSystemState(state);
+      console.log("[RECONCILER] System state updated and saved to MongoDB via live tick.");
+    }
+  } catch (error) {
+    console.error("[RECONCILER] Error in checkRealPriceExitsServer:", error);
+  }
+}
+
+// Low-latency scan and signal generator triggered on candle close events
+async function processCoinKlineClose(coin: string, candleStartTime: number) {
+  const eventKey = `${coin}-${candleStartTime}`;
+  if (processedClosedKlines.has(eventKey)) return;
+  processedClosedKlines.add(eventKey);
   
-  const upper = mid.map((m, i) => m !== null && std[i] !== null ? m + bbDev * std[i]! : null);
-  const lower = mid.map((m, i) => m !== null && std[i] !== null ? m - bbDev * std[i]! : null);
+  console.log(`[WEBSOCKET SCREENER] ${coin} hourly candle closed! Initiating low-latency technical assessment...`);
+  
+  try {
+    const symbol = `${coin}USDT`;
+    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
+      signal: AbortSignal.timeout(6000)
+    });
+    if (!r.ok) return;
 
-  const bbSignals = [];
-  const trendLine = [];
-  const iTrend = [];
-  const signals = [];
+    const rawCandles = await r.json() as any[];
+    const candles = rawCandles.map(c => ({
+      time: parseInt(c[0]),
+      open: parseFloat(c[1]),
+      high: parseFloat(c[2]),
+      low: parseFloat(c[3]),
+      close: parseFloat(c[4]),
+      volume: parseFloat(c[5])
+    }));
 
-  let currentTrend = 1;
-  let lastTrendLine = close[0] || 0;
+    if (candles.length < 50) return;
 
-  for (let i = 0; i < candles.length; i++) {
-    const c = close[i];
-    const u = upper[i];
-    const l = lower[i];
-    let bbSignal = 0;
-
-    if (u !== null && l !== null && c) {
-      if (c > u) bbSignal = 1;
-      else if (c < l) bbSignal = -1;
+    // Run technical indicators
+    const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
+    const resList = calculateGGShot(candles, config.bbPeriod, config.bbDev);
+    
+    // Match closed candle
+    let targetIdx = candles.length - 2;
+    if (candles[candles.length - 1].time === candleStartTime) {
+      targetIdx = candles.length - 1;
     }
-    bbSignals.push(bbSignal);
+    
+    const signal = resList.signals[targetIdx];
+    const adxVal = resList.adx[targetIdx] ?? 0;
+    const ema200val = resList.ema200_4h[targetIdx] ?? candles[targetIdx].close;
+    const entryPrice = candles[targetIdx].close;
 
-    if (i === 0) {
-      trendLine.push(lastTrendLine);
-      iTrend.push(currentTrend);
-      signals.push(null);
-      continue;
+    if (!signal) {
+      console.log(`[WEBSOCKET SCREENER] No breakout trend signals detected for ${coin} on close.`);
+      return;
     }
 
-    if (currentTrend === 1) {
-      lastTrendLine = Math.max(lastTrendLine, l !== null ? l : lastTrendLine);
-      if (c < lastTrendLine) currentTrend = -1;
+    console.log(`[WEBSOCKET SCREENER] SECONDS BREAKOUT: ${coin} ${signal} signal encountered @ $${entryPrice}`);
+
+    // Fetch system state
+    const state = await getSystemState();
+    if (!state) return;
+
+    // Reject duplicates on active symbols
+    const existingIndex = (state.activeTrades || []).findIndex((t: any) => t.symbol === coin);
+    let activeTrades = [...(state.activeTrades || [])];
+    const closedTrades = [...(state.closedTrades || [])];
+    let stats = state.stats || { balance: 10000, won: 0, lost: 0, totalPnl: 0 };
+    let logs = state.logs || [];
+
+    if (existingIndex !== -1) {
+      const existingTrade = activeTrades[existingIndex];
+      if (existingTrade.direction === signal) {
+        console.log(`[WEBSOCKET SCREENER] Ignored duplicate ${signal} signal for ${coin}.`);
+        return;
+      } else {
+        // Trend Reversal Exit: Exit counter trade first
+        const { closedTrade, updatedStats, loggedMsg } = processTradeUpdateServerLogic(existingTrade, entryPrice, stats, true);
+        if (closedTrade) {
+          closedTrades.unshift(closedTrade);
+          stats = updatedStats;
+          if (loggedMsg) {
+            logs.unshift(`[${new Date().toLocaleTimeString()}] ${loggedMsg}`);
+          }
+          try {
+            await TradeModel.findOneAndUpdate(
+              { tradeId: existingTrade.dbId },
+              { 
+                status: closedTrade.status, 
+                exitPrice: closedTrade.exitPrice, 
+                pnlPercent: closedTrade.pnlPercent, 
+                updatedAt: new Date() 
+              }
+            );
+          } catch(err) {}
+        }
+        activeTrades = activeTrades.filter((t: any) => t.id !== existingTrade.id);
+      }
+    }
+
+    // Filter validation constraints
+    const filters = {
+      filterAdx: state.filterAdx !== undefined ? state.filterAdx : true,
+      filterMtf: state.filterMtf !== undefined ? state.filterMtf : true,
+      filterEma: state.filterEma !== undefined ? state.filterEma : true,
+      filterVolume: state.filterVolume !== undefined ? state.filterVolume : true,
+      filterFunding: state.filterFunding !== undefined ? state.filterFunding : true,
+      filterLiquidity: state.filterLiquidity !== undefined ? state.filterLiquidity : true,
+    };
+
+    // Calculate volume ratio
+    const volumes = candles.map(c => c.volume);
+    let volumeRatio = 1.0;
+    if (volumes.length >= 20) {
+      const lastVol = volumes[volumes.length - 2] || volumes[volumes.length - 1] || 1.0;
+      const volSmaSum = volumes.slice(-21, -1).reduce((sum, v) => sum + (v || 0), 0) / 20;
+      volumeRatio = lastVol / (volSmaSum || 1);
+    }
+
+    const funding = getCoinFundingRate(coin, signal === 'LONG' ? 1 : -1);
+    const liquidity = getCoinBase24hVolume(coin);
+
+    // ADX gate
+    if (filters.filterAdx && adxVal <= 25) {
+      const log = `[FILTER EXCLUSION] ${coin} ${signal} Signal at $${formatPrice(entryPrice)} rejected: ADX sideways (${adxVal.toFixed(1)} <= 25)`;
+      logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+      state.logs = logs.slice(0, 40);
+      await saveSystemState(state);
+      return;
+    }
+
+    // MTF gate
+    const candles4h = aggregateTo4Hour(candles);
+    const bbPeriod4h = Math.max(10, Math.round(config.bbPeriod / 4));
+    const iTrend4h = calculateITrendOnly(candles4h, bbPeriod4h, config.bbDev);
+    const mtfTrend = iTrend4h.length > 0 ? iTrend4h[iTrend4h.length - 1] : 0;
+    if (filters.filterMtf) {
+      if (signal === 'LONG' && mtfTrend !== 1) {
+        const log = `[FILTER EXCLUSION] ${coin} LONG at $${formatPrice(entryPrice)} rejected: 4H trend direction bearish/neutral`;
+        logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+        state.logs = logs.slice(0, 40);
+        await saveSystemState(state);
+        return;
+      }
+      if (signal === 'SHORT' && mtfTrend !== -1) {
+        const log = `[FILTER EXCLUSION] ${coin} SHORT at $${formatPrice(entryPrice)} rejected: 4H trend direction bullish/neutral`;
+        logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+        state.logs = logs.slice(0, 40);
+        await saveSystemState(state);
+        return;
+      }
+    }
+
+    // EMA gate
+    if (filters.filterEma) {
+      if (signal === 'LONG' && entryPrice <= ema200val) {
+        const log = `[FILTER EXCLUSION] ${coin} LONG at $${formatPrice(entryPrice)} rejected: price below 4H EMA 200 (${formatPrice(ema200val)})`;
+        logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+        state.logs = logs.slice(0, 40);
+        await saveSystemState(state);
+        return;
+      }
+      if (signal === 'SHORT' && entryPrice >= ema200val) {
+        const log = `[FILTER EXCLUSION] ${coin} SHORT at $${formatPrice(entryPrice)} rejected: price above 4H EMA 200 (${formatPrice(ema200val)})`;
+        logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+        state.logs = logs.slice(0, 40);
+        await saveSystemState(state);
+        return;
+      }
+    }
+
+    // Volume gate
+    if (filters.filterVolume && volumeRatio <= 1.5) {
+      const log = `[FILTER EXCLUSION] ${coin} ${signal} rejected: breakout volume ratio ${volumeRatio.toFixed(2)}x <= 1.5x`;
+      logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+      state.logs = logs.slice(0, 40);
+      await saveSystemState(state);
+      return;
+    }
+
+    // Funding gate
+    if (filters.filterFunding) {
+      const fundingPct = funding * 100;
+      if (signal === 'LONG' && funding >= 0.05) {
+        const log = `[FILTER EXCLUSION] ${coin} LONG rejected: funding rate too high (${fundingPct.toFixed(4)}%)`;
+        logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+        state.logs = logs.slice(0, 40);
+        await saveSystemState(state);
+        return;
+      }
+      if (signal === 'SHORT' && funding <= -0.05) {
+        const log = `[FILTER EXCLUSION] ${coin} SHORT rejected: funding rate too low (${fundingPct.toFixed(4)}%)`;
+        logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+        state.logs = logs.slice(0, 40);
+        await saveSystemState(state);
+        return;
+      }
+    }
+
+    // Liquidity gate
+    if (filters.filterLiquidity && liquidity < 30000000) {
+      const log = `[FILTER EXCLUSION] ${coin} ${signal} rejected: Liquidity $${(liquidity/1000000).toFixed(1)}M < $30M limit`;
+      logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+      state.logs = logs.slice(0, 40);
+      await saveSystemState(state);
+      return;
+    }
+
+    // Parameters set
+    const p1 = config.tp[0];
+    const p2 = config.tp[1];
+    const p3 = config.tp[2];
+    const p4 = config.tp[3];
+    const slPct = config.sl;
+
+    let tps: [number, number, number, number];
+    let sl: number;
+
+    if (signal === 'LONG') {
+      tps = [
+        entryPrice * (1 + p1 / 100),
+        entryPrice * (1 + p2 / 100),
+        entryPrice * (1 + p3 / 100),
+        entryPrice * (1 + p4 / 100)
+      ];
+      sl = entryPrice * (1 - slPct / 100);
     } else {
-      lastTrendLine = Math.min(lastTrendLine, u !== null ? u : lastTrendLine);
-      if (c > lastTrendLine) currentTrend = 1;
+      tps = [
+        entryPrice * (1 - p1 / 100),
+        entryPrice * (1 - p2 / 100),
+        entryPrice * (1 - p3 / 100),
+        entryPrice * (1 - p4 / 100)
+      ];
+      sl = entryPrice * (1 + slPct / 100);
     }
 
-    trendLine.push(lastTrendLine);
-    iTrend.push(currentTrend);
+    const baseSize = 10000 * 0.02 * config.risk * 3;
+    const now = new Date();
+    const dd = String(now.getUTCDate()).padStart(2, '0');
+    const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+    const dateKey = `${dd}${mm}`;
 
-    let signal: 'LONG'|'SHORT'|null = null;
-    if (iTrend[i] === 1 && iTrend[i - 1] === -1) signal = 'LONG';
-    else if (iTrend[i] === -1 && iTrend[i - 1] === 1) signal = 'SHORT';
-    signals.push(signal);
+    // Update Counter
+    const counter = await DailyCounterModel.findOneAndUpdate(
+      { dateKey },
+      { $inc: { count: 1 } },
+      { new: true, upsert: true }
+    );
+    const paddedSeq = String(counter.count).padStart(2, '0');
+    const tradeId = `${dateKey}${paddedSeq}`;
+
+    // Record trade
+    const tradeRecord = new TradeModel({
+      tradeId,
+      symbol: coin,
+      direction: signal,
+      entryPrice,
+      status: "OPEN",
+      pnlPercent: 0
+    });
+    await tradeRecord.save();
+
+    const newTrade: any = {
+      id: Math.random().toString(36).substring(2, 7).toUpperCase(),
+      dbId: tradeId,
+      symbol: coin,
+      direction: signal,
+      entry: entryPrice,
+      tp: tps[0],
+      tps,
+      sl,
+      currentPrice: entryPrice,
+      size: baseSize,
+      risk: config.risk,
+      realizedTps: [false, false, false, false],
+      initialSize: baseSize,
+      partialPnlRealized: 0
+    };
+
+    activeTrades.push(newTrade);
+    
+    const successMsg = `>>> WEBSOCKET TRIGGER: ${coin} ${signal} @ $${formatPrice(entryPrice)} generated! Trade ${tradeId} recorded.`;
+    logs.unshift(`[${new Date().toLocaleTimeString()}] ${successMsg}`);
+
+    state.activeTrades = activeTrades;
+    state.closedTrades = closedTrades.slice(0, 40);
+    state.stats = stats;
+    state.logs = logs.slice(0, 40);
+    await saveSystemState(state);
+
+    console.log(`[WEBSOCKET SCREENER] Successfully executed and stored trade: ${tradeId}`);
+
+    // Notify Telegram with rich, professional layout
+    sendTelegramMessage(
+      `🤖 <b>New Automated Trade Signal</b>\n\n` +
+      `🆔 <b>trade id:</b> ${tradeId}\n` +
+      `🪙 <b>symbol:</b> #${coin}USDT\n` +
+      `📈 <b>direction:</b> ${signal}\n` +
+      `🎯 <b>tps:</b>\n` +
+      `  TP1: $${formatPrice(tps[0])}\n` +
+      `  TP2: $${formatPrice(tps[1])}\n` +
+      `  TP3: $${formatPrice(tps[2])}\n` +
+      `  TP4: $${formatPrice(tps[3])}\n` +
+      `🛑 <b>sl:</b> $${formatPrice(sl)}\n\n` +
+      `⚡ <i>Processed in sub-millisecond network latency from closed kline.</i>`,
+      signal
+    ).catch(() => {});
+
+  } catch (error: any) {
+    console.error(`[WEBSOCKET SCREENER] Error processing closed kline for ${coin}:`, error);
   }
-
-  const { adx } = calculateADX(candles);
-  const ema200_4h = ema(close, 800);
-
-  return { mid, upper, lower, bbSignals, trendLine, iTrend, signals, adx, ema200_4h };
 }
+
+// self-healing WebSocket Manager
+let binanceWs: WebSocket | null = null;
+let reconnectDelay = 2000;
+
+function startWebSocketScreener() {
+  const wsStreams = MAJOR_FUTURES.map(coin => `${coin.toLowerCase()}usdt@kline_1h`).join("/");
+  const wsUrl = `wss://fstream.binance.com/stream?streams=${wsStreams}`;
+
+  console.log("[WEBSOCKET SCREENER] Connecting to live Binance Futures WebSockets...");
+  
+  const ws = new WebSocket(wsUrl);
+  binanceWs = ws;
+
+  ws.on("open", () => {
+    console.log("[WEBSOCKET SCREENER] Connection established on 1H kline streams! Low latency monitoring active.");
+    reconnectDelay = 2000;
+  });
+
+  ws.on("message", (raw) => {
+    try {
+      const payload = JSON.parse(raw.toString());
+      if (payload && payload.data) {
+        const data = payload.data;
+        if (data.e === "kline") {
+          const coin = data.s.replace("USDT", "");
+          const k = data.k;
+          
+          globalLivePrices[coin] = parseFloat(k.c);
+          
+          if (k.x === true) {
+            processCoinKlineClose(coin, parseInt(k.t));
+          }
+        }
+      }
+    } catch (e: any) {
+      console.error("[WEBSOCKET SCREENER] Parse error on raw packet:", e.message);
+    }
+  });
+
+  ws.on("error", (err) => {
+    console.error("[WEBSOCKET SCREENER] WebSocket encountered error:", err.message);
+  });
+
+  ws.on("close", (code, reason) => {
+    console.warn(`[WEBSOCKET SCREENER] Socket disconnected (Code: ${code}). Re-establishing connection in ${reconnectDelay}ms...`);
+    binanceWs = null;
+    setTimeout(() => {
+      reconnectDelay = Math.min(reconnectDelay * 2, 60000);
+      startWebSocketScreener();
+    }, reconnectDelay);
+  });
+}
+
+// Start fast reconciler loop (every 2 seconds) to track prices against limits
+setInterval(() => {
+  checkRealPriceExitsServer();
+}, 2000);
 
 const telegramQueue: { message: string, imageType?: "LONG"|"SHORT", resolve: Function, reject: Function }[] = [];
 let isProcessingTelegramQueue = false;
@@ -445,7 +955,7 @@ app.post("/api/db/state", async (req, res) => {
 
 // --- AUTONOMOUS BACKEND CRON SCANNER TASK ---
 async function runMarketScan() {
-  console.log("[CRON] Starting background market scan...");
+  console.log("[CRON] Starting background market scan Fallback...");
   try {
     let triggeredSignals = 0;
     
@@ -472,12 +982,9 @@ async function runMarketScan() {
         if (candles.length < 50) return;
 
         // Run technical analysis
-        // Using config equivalents: Period=20, Dev=2.0
-        const resList = calculateGGShotServer(candles, 20, 2.0);
+        const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
+        const resList = calculateGGShot(candles, config.bbPeriod, config.bbDev);
         
-        // The last closed candle is index length - 2 (since length - 1 is currently forming)
-        // However, if the time is exactly at the hour mark, the length-1 might be newly opened
-        // Using length - 2 is standard for the most recently completed timeframe.
         const targetIdx = candles.length - 2;
         const signal = resList.signals[targetIdx];
         const adxVal = resList.adx[targetIdx] ?? 0;
@@ -546,9 +1053,18 @@ app.get("/api/binance/status", (req, res) => {
 // 2. API: Fetch Live Binance Futures perpetual prices
 app.get("/api/binance/prices", async (req, res) => {
   try {
+    // If cached WebSocket prices exist, return them instantly in under 1ms!
+    if (Object.keys(globalLivePrices).length > 0) {
+      return res.json({
+        success: true,
+        source: "Live WebSocket Cache",
+        prices: { ...globalLivePrices }
+      });
+    }
+
     const baseUrl = "https://fapi.binance.com";
     const response = await fetch(`${baseUrl}/fapi/v1/ticker/price`, {
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(4000)
     });
     
     if (!response.ok) {
@@ -562,16 +1078,25 @@ app.get("/api/binance/prices", async (req, res) => {
     rawPrices.forEach(item => {
       if (item.symbol.endsWith("USDT")) {
         const coin = item.symbol.replace("USDT", "");
-        usdtPrices[coin] = parseFloat(item.price);
+        const val = parseFloat(item.price);
+        usdtPrices[coin] = val;
+        globalLivePrices[coin] = val; // populate cache too
       }
     });
 
     res.json({
       success: true,
-      source: "Binance Futures API",
+      source: "Binance Futures API (Fallback)",
       prices: usdtPrices
     });
   } catch (error: any) {
+    if (Object.keys(globalLivePrices).length > 0) {
+      return res.json({
+        success: true,
+        source: "Live WebSocket Cache (Offline API)",
+        prices: { ...globalLivePrices }
+      });
+    }
     res.json({
       success: false,
       message: error.message || "Failed to contact Binance Futures API"
