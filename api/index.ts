@@ -17,7 +17,44 @@ if (mongoUri && mongoUri.includes("123sami@gg-shot")) {
   mongoUri = "mongodb+srv://Sami:sami%40123sami@gg-shot.ybpg66p.mongodb.net/?appName=GG-Shot";
 }
 
-let db: any = null;
+// Fallback In-Memory DB
+let memoryDbState: any = {
+  id: "main",
+  activeTrades: [],
+  closedTrades: [],
+  stats: { balance: 10000, won: 0, lost: 0, totalPnl: 0 },
+  logs: [],
+  filterAdx: true,
+  filterMtf: true,
+  filterEma: true,
+  filterVolume: true,
+  filterFunding: true,
+  filterLiquidity: true,
+};
+
+const memoryDb = {
+  collection: (name: string) => {
+    return {
+      findOne: async (query: any) => {
+        if (name === "system_state") {
+          return { ...memoryDbState };
+        }
+        return null;
+      },
+      updateOne: async (query: any, update: any, options?: any) => {
+        if (name === "system_state") {
+          if (update.$set) {
+            memoryDbState = { ...memoryDbState, ...update.$set };
+          }
+          return { modifiedCount: 1 };
+        }
+        return { modifiedCount: 0 };
+      }
+    };
+  }
+};
+
+let db: any = memoryDb; // Default to memoryDb
 
 const TradeSchema = new mongoose.Schema({
   tradeId: { type: String, required: true, unique: true },
@@ -40,6 +77,30 @@ const DailyCounterSchema = new mongoose.Schema({
 
 const DailyCounterModel = mongoose.model("DailyCounter", DailyCounterSchema);
 
+// Simple in-memory fallback counters
+const inMemoryCounters = new Map<string, number>();
+
+async function getNextTradeCount(dateKey: string): Promise<number> {
+  if (mongoose.connection.readyState === 1) {
+    try {
+      const counter = await DailyCounterModel.findOneAndUpdate(
+        { dateKey },
+        { $inc: { count: 1 } },
+        { new: true, upsert: true }
+      );
+      if (counter && typeof counter.count === 'number') {
+        return counter.count;
+      }
+    } catch (err) {
+      console.warn("[DB] Counter update failed, using in-memory:", err);
+    }
+  }
+  const current = inMemoryCounters.get(dateKey) || 0;
+  const next = current + 1;
+  inMemoryCounters.set(dateKey, next);
+  return next;
+}
+
 if (mongoUri) {
   // Original DB setup
   const client = new MongoClient(mongoUri);
@@ -49,7 +110,9 @@ if (mongoUri) {
     // Start WebSocket Screener once DB is connected!
     startWebSocketScreener();
   }).catch((err) => {
-    console.error("MongoDB connection failed:", err);
+    console.error("MongoDB connection failed, using memory DB:", err);
+    db = memoryDb;
+    startWebSocketScreener();
   });
 
   // Mongoose setup
@@ -58,6 +121,12 @@ if (mongoUri) {
   }).catch(err => {
     console.error("Mongoose connection failed:", err);
   });
+} else {
+  console.warn("No MONGODB_URI environment variable detected. Running with In-Memory State DB fallbacks.");
+  db = memoryDb;
+  setTimeout(() => {
+    startWebSocketScreener();
+  }, 100);
 }
 
 const MAJOR_FUTURES = [
@@ -70,6 +139,327 @@ const globalLivePrices: Record<string, number> = {};
 
 // Keep a set of processed keys to strictly prevent double executions (idempotency)
 const processedClosedKlines = new Set<string>();
+
+// In-memory low-latency candle cache and hourly signal tracking
+const serverCoinsCandles: Record<string, any[]> = {};
+const lastTradeCandleTime = new Map<string, number>();
+
+async function getOrFetchCandles(coin: string): Promise<any[] | null> {
+  if (serverCoinsCandles[coin] && serverCoinsCandles[coin].length > 0) {
+    return serverCoinsCandles[coin];
+  }
+  
+  try {
+    const symbol = `${coin}USDT`;
+    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
+      signal: AbortSignal.timeout(6000)
+    });
+    if (!r.ok) return null;
+    const rawCandles = await r.json() as any[];
+    const candles = rawCandles.map(c => ({
+      time: parseInt(c[0]),
+      open: parseFloat(c[1]),
+      high: parseFloat(c[2]),
+      low: parseFloat(c[3]),
+      close: parseFloat(c[4]),
+      volume: parseFloat(c[5])
+    }));
+    if (candles.length > 0) {
+      serverCoinsCandles[coin] = candles;
+      return candles;
+    }
+  } catch (err) {
+    console.error(`[CANDLE CACHE] Error seeding history for ${coin}:`, err);
+  }
+  return null;
+}
+
+async function updateCoinCandleCacheAndCheck(coin: string, k: any) {
+  const candles = await getOrFetchCandles(coin);
+  if (!candles || candles.length === 0) return;
+
+  const candleStartTime = parseInt(k.t);
+  const price = parseFloat(k.c);
+  const high = parseFloat(k.h);
+  const low = parseFloat(k.l);
+  const volume = parseFloat(k.v);
+
+  const lastIndex = candles.length - 1;
+  const lastCandle = candles[lastIndex];
+
+  if (candleStartTime > lastCandle.time) {
+    candles.push({
+      time: candleStartTime,
+      open: parseFloat(k.o),
+      high,
+      low,
+      close: price,
+      volume
+    });
+    if (candles.length > 1000) {
+      candles.shift();
+    }
+    console.log(`[CANDLE CACHE] ${coin} New candle initiated: ${new Date(candleStartTime).toISOString()}`);
+  } else if (candleStartTime === lastCandle.time) {
+    lastCandle.close = price;
+    lastCandle.high = Math.max(lastCandle.high, high);
+    lastCandle.low = Math.min(lastCandle.low, low);
+    lastCandle.volume = volume;
+  } else {
+    return;
+  }
+
+  const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
+  const resList = calculateGGShot(candles, config.bbPeriod, config.bbDev, coin);
+
+  const targetIdx = candles.length - 1;
+  const signal = resList.signals[targetIdx];
+
+  if (!signal) {
+    return;
+  }
+
+  if (lastTradeCandleTime.get(coin) === candleStartTime) {
+    return;
+  }
+
+  const entryPrice = price;
+  const adxVal = resList.adx[targetIdx] ?? 0;
+  const ema200val = resList.ema200_4h[targetIdx] ?? entryPrice;
+
+  console.log(`[LOW-LATENCY RUNTIME] DETECTED ${coin} ${signal} crossover on current 1H candle at $${entryPrice}! Checking Confluence Gates...`);
+
+  const state = await getSystemState();
+  if (!state) return;
+
+  const existingIndex = (state.activeTrades || []).findIndex((t: any) => t.symbol === coin);
+  let activeTrades = [...(state.activeTrades || [])];
+  const closedTrades = [...(state.closedTrades || [])];
+  let stats = state.stats || { balance: 10000, won: 0, lost: 0, totalPnl: 0 };
+  let logs = state.logs || [];
+
+  if (existingIndex !== -1) {
+    const existingTrade = activeTrades[existingIndex];
+    if (existingTrade.direction === signal) {
+      return;
+    } else {
+      console.log(`[LOW-LATENCY RUNTIME] ${coin} reversal detected! Exiting existing ${existingTrade.direction} before entering ${signal}`);
+      const { closedTrade, updatedStats, loggedMsg } = processTradeUpdateServerLogic(existingTrade, entryPrice, stats, true);
+      if (closedTrade) {
+        closedTrades.unshift(closedTrade);
+        stats = updatedStats;
+        if (loggedMsg) {
+          logs.unshift(`[${new Date().toLocaleTimeString()}] ${loggedMsg}`);
+        }
+        try {
+          await TradeModel.findOneAndUpdate(
+            { tradeId: existingTrade.dbId },
+            { 
+              status: closedTrade.status, 
+              exitPrice: closedTrade.exitPrice, 
+              pnlPercent: closedTrade.pnlPercent, 
+              updatedAt: new Date() 
+            }
+          );
+        } catch(err) {}
+      }
+      activeTrades = activeTrades.filter((t: any) => t.id !== existingTrade.id);
+    }
+  }
+
+  const filters = {
+    filterAdx: state.filterAdx !== undefined ? state.filterAdx : true,
+    filterMtf: state.filterMtf !== undefined ? state.filterMtf : true,
+    filterEma: state.filterEma !== undefined ? state.filterEma : true,
+    filterVolume: state.filterVolume !== undefined ? state.filterVolume : true,
+    filterFunding: state.filterFunding !== undefined ? state.filterFunding : true,
+    filterLiquidity: state.filterLiquidity !== undefined ? state.filterLiquidity : true,
+  };
+
+  if (filters.filterAdx && adxVal <= 25) {
+    const log = `[CONFLUENCE REJECT] ${coin} ${signal} @ $${entryPrice} blocked: ADX sideways (${adxVal.toFixed(1)} <= 25)`;
+    logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+    state.logs = logs.slice(0, 40);
+    await saveSystemState(state);
+    lastTradeCandleTime.set(coin, candleStartTime);
+    return;
+  }
+
+  const mtfTrend = resList.mtf4hITrend;
+  if (filters.filterMtf) {
+    if (signal === 'LONG' && mtfTrend !== 1) {
+      const log = `[CONFLUENCE REJECT] ${coin} LONG @ $${entryPrice} blocked: 4H trend is bearish/neutral`;
+      logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+      state.logs = logs.slice(0, 40);
+      await saveSystemState(state);
+      lastTradeCandleTime.set(coin, candleStartTime);
+      return;
+    }
+    if (signal === 'SHORT' && mtfTrend !== -1) {
+      const log = `[CONFLUENCE REJECT] ${coin} SHORT @ $${entryPrice} blocked: 4H trend is bullish/neutral`;
+      logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+      state.logs = logs.slice(0, 40);
+      await saveSystemState(state);
+      lastTradeCandleTime.set(coin, candleStartTime);
+      return;
+    }
+  }
+
+  if (filters.filterEma) {
+    if (signal === 'LONG' && entryPrice <= ema200val) {
+      const log = `[CONFLUENCE REJECT] ${coin} LONG @ $${entryPrice} blocked: price below 4H EMA 200 ($${formatPrice(ema200val)})`;
+      logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+      state.logs = logs.slice(0, 40);
+      await saveSystemState(state);
+      lastTradeCandleTime.set(coin, candleStartTime);
+      return;
+    }
+    if (signal === 'SHORT' && entryPrice >= ema200val) {
+      const log = `[CONFLUENCE REJECT] ${coin} SHORT @ $${entryPrice} blocked: price above 4H EMA 200 ($${formatPrice(ema200val)})`;
+      logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+      state.logs = logs.slice(0, 40);
+      await saveSystemState(state);
+      lastTradeCandleTime.set(coin, candleStartTime);
+      return;
+    }
+  }
+
+  const volumeRatio = resList.volumeRatio;
+  if (filters.filterVolume && volumeRatio <= 1.5) {
+    const log = `[CONFLUENCE REJECT] ${coin} ${signal} @ $${entryPrice} blocked: Volume participation ${volumeRatio.toFixed(2)}x <= 1.5x`;
+    logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+    state.logs = logs.slice(0, 40);
+    await saveSystemState(state);
+    lastTradeCandleTime.set(coin, candleStartTime);
+    return;
+  }
+
+  const funding = resList.fundingRate;
+  if (filters.filterFunding) {
+    const fundingPct = funding * 100;
+    if (signal === 'LONG' && funding >= 0.05) {
+      const log = `[CONFLUENCE REJECT] ${coin} LONG @ $${entryPrice} blocked: Funding rate too high (${fundingPct.toFixed(4)}%)`;
+      logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+      state.logs = logs.slice(0, 40);
+      await saveSystemState(state);
+      lastTradeCandleTime.set(coin, candleStartTime);
+      return;
+    }
+    if (signal === 'SHORT' && funding <= -0.05) {
+      const log = `[CONFLUENCE REJECT] ${coin} SHORT @ $${entryPrice} blocked: Funding rate too low (${fundingPct.toFixed(4)}%)`;
+      logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+      state.logs = logs.slice(0, 40);
+      await saveSystemState(state);
+      lastTradeCandleTime.set(coin, candleStartTime);
+      return;
+    }
+  }
+
+  const liquidity = resList.volume24hUsdt;
+  if (filters.filterLiquidity && liquidity < 30000000) {
+    const log = `[CONFLUENCE REJECT] ${coin} ${signal} @ $${entryPrice} blocked: Liquidity $${(liquidity/1000000).toFixed(1)}M < $30M limit`;
+    logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+    state.logs = logs.slice(0, 40);
+    await saveSystemState(state);
+    lastTradeCandleTime.set(coin, candleStartTime);
+    return;
+  }
+
+  lastTradeCandleTime.set(coin, candleStartTime);
+
+  const p1 = config.tp[0];
+  const p2 = config.tp[1];
+  const p3 = config.tp[2];
+  const p4 = config.tp[3];
+  const slPct = config.sl;
+
+  let tps: [number, number, number, number];
+  let sl: number;
+
+  if (signal === 'LONG') {
+    tps = [
+      entryPrice * (1 + p1 / 100),
+      entryPrice * (1 + p2 / 100),
+      entryPrice * (1 + p3 / 100),
+      entryPrice * (1 + p4 / 100)
+    ];
+    sl = entryPrice * (1 - slPct / 100);
+  } else {
+    tps = [
+      entryPrice * (1 - p1 / 100),
+      entryPrice * (1 - p2 / 100),
+      entryPrice * (1 - p3 / 100),
+      entryPrice * (1 - p4 / 100)
+    ];
+    sl = entryPrice * (1 + slPct / 100);
+  }
+
+  const baseSize = 10000 * 0.02 * config.risk * 3;
+  const now = new Date();
+  const dd = String(now.getUTCDate()).padStart(2, '0');
+  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const dateKey = `${dd}${mm}`;
+
+  const count = await getNextTradeCount(dateKey);
+  const paddedSeq = String(count).padStart(2, '0');
+  const tradeId = `${dateKey}${paddedSeq}`;
+
+  const tradeRecord = new TradeModel({
+    tradeId,
+    symbol: coin,
+    direction: signal,
+    entryPrice,
+    status: "OPEN",
+    pnlPercent: 0
+  });
+  await tradeRecord.save();
+
+  const newTrade: any = {
+    id: Math.random().toString(36).substring(2, 7).toUpperCase(),
+    dbId: tradeId,
+    symbol: coin,
+    direction: signal,
+    entry: entryPrice,
+    tp: tps[0],
+    tps,
+    sl,
+    currentPrice: entryPrice,
+    size: baseSize,
+    risk: config.risk,
+    realizedTps: [false, false, false, false],
+    initialSize: baseSize,
+    partialPnlRealized: 0
+  };
+
+  activeTrades.push(newTrade);
+
+  const successMsg = `>>> WEBSOCKET TRIGGER: ${coin} ${signal} @ $${formatPrice(entryPrice)} generated! Trade ${tradeId} recorded.`;
+  logs.unshift(`[${new Date().toLocaleTimeString()}] ${successMsg}`);
+
+  state.activeTrades = activeTrades;
+  state.closedTrades = closedTrades.slice(0, 40);
+  state.stats = stats;
+  state.logs = logs.slice(0, 40);
+
+  await saveSystemState(state);
+
+  console.log(`[LOW-LATENCY RUNTIME] Successfully executed and stored trade: ${tradeId}`);
+
+  sendTelegramMessage(
+    `🤖 <b>New Automated Trade Signal</b>\n\n` +
+    `🆔 <b>trade id:</b> ${tradeId}\n` +
+    `🪙 <b>symbol:</b> #${coin}USDT\n` +
+    `📈 <b>direction:</b> ${signal}\n` +
+    `🎯 <b>tps:</b>\n` +
+    `  TP1: $${formatPrice(tps[0])}\n` +
+    `  TP2: $${formatPrice(tps[1])}\n` +
+    `  TP3: $${formatPrice(tps[2])}\n` +
+    `  TP4: $${formatPrice(tps[3])}\n` +
+    `🛑 <b>sl:</b> $${formatPrice(sl)}\n\n` +
+    `⚡ <i>Processed in real-time low-latency local indicator analysis.</i>`,
+    signal
+  ).catch(() => {});
+}
 
 // DB State helpers
 async function getSystemState() {
@@ -400,7 +790,7 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
 
     // Run technical indicators
     const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
-    const resList = calculateGGShot(candles, config.bbPeriod, config.bbDev);
+    const resList = calculateGGShot(candles, config.bbPeriod, config.bbDev, coin);
     
     // Match closed candle
     let targetIdx = candles.length - 2;
@@ -604,12 +994,8 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
     const dateKey = `${dd}${mm}`;
 
     // Update Counter
-    const counter = await DailyCounterModel.findOneAndUpdate(
-      { dateKey },
-      { $inc: { count: 1 } },
-      { new: true, upsert: true }
-    );
-    const paddedSeq = String(counter.count).padStart(2, '0');
+    const count = await getNextTradeCount(dateKey);
+    const paddedSeq = String(count).padStart(2, '0');
     const tradeId = `${dateKey}${paddedSeq}`;
 
     // Record trade
@@ -703,9 +1089,10 @@ function startWebSocketScreener() {
           
           globalLivePrices[coin] = parseFloat(k.c);
           
-          if (k.x === true) {
-            processCoinKlineClose(coin, parseInt(k.t));
-          }
+          // Low-latency local candle caching, indicator calculations, and real-time confluence signal monitoring
+          updateCoinCandleCacheAndCheck(coin, k).catch(err => {
+            console.error(`[LOW-LATENCY RUNTIME] Error in cache check for ${coin}:`, err.message);
+          });
         }
       }
     } catch (e: any) {
@@ -829,12 +1216,8 @@ app.post("/api/trades/record", async (req, res) => {
     if (status === "OPEN" && localId) {
        // Only increment the counter and create new if it doesn't already exist with this localId as a fallback logic
        // Actually, to keep it simple, we generate a formal DB ID and return it
-       const counter = await DailyCounterModel.findOneAndUpdate(
-         { dateKey },
-         { $inc: { count: 1 } },
-         { new: true, upsert: true }
-       );
-       const paddedSeq = String(counter.count).padStart(2, '0');
+       const count = await getNextTradeCount(dateKey);
+       const paddedSeq = String(count).padStart(2, '0');
        const tradeId = `${dateKey}${paddedSeq}`;
 
        tradeRecord = new TradeModel({
@@ -1008,7 +1391,7 @@ async function runMarketScan() {
 
         // Run technical analysis
         const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
-        const resList = calculateGGShot(candles, config.bbPeriod, config.bbDev);
+        const resList = calculateGGShot(candles, config.bbPeriod, config.bbDev, coin);
         
         const targetIdx = candles.length - 2;
         const signal = resList.signals[targetIdx];

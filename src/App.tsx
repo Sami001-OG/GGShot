@@ -691,8 +691,8 @@ export default function App() {
   
   const ggResult = useMemo(() => {
     if (candleData.length === 0) return null;
-    return calculateGGShot(candleData, coinConfig.bbPeriod, coinConfig.bbDev);
-  }, [candleData, coinConfig.bbPeriod, coinConfig.bbDev]);
+    return calculateGGShot(candleData, coinConfig.bbPeriod, coinConfig.bbDev, selectedCoin);
+  }, [candleData, coinConfig.bbPeriod, coinConfig.bbDev, selectedCoin]);
 
   const winRate = stats.won + stats.lost > 0 
     ? ((stats.won / (stats.won + stats.lost)) * 100).toFixed(1) 

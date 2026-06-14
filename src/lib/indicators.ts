@@ -249,27 +249,39 @@ export function calculateITrendOnly(candles: Candle[], period: number, dev: numb
   const trendLine = Array(n).fill(0);
   const iTrend = Array(n).fill(0);
 
+  if (n > 0) {
+    trendLine[0] = closes[0];
+    iTrend[0] = 0;
+  }
+
   for (let i = 1; i < n; i++) {
     const s = bbSignals[i];
+    let dir = iTrend[i - 1];
     if (s === 1) {
-      trendLine[i] = lows[i];
-      if (trendLine[i] < trendLine[i - 1]) {
-        trendLine[i] = trendLine[i - 1];
-      }
+      dir = 1;
     } else if (s === -1) {
-      trendLine[i] = highs[i];
-      if (trendLine[i] > trendLine[i - 1]) {
-        trendLine[i] = trendLine[i - 1];
+      dir = -1;
+    }
+    iTrend[i] = dir;
+
+    if (dir === 1) {
+      const prevTrendVal = trendLine[i - 1];
+      const currentLow = lows[i];
+      if (iTrend[i - 1] <= 0) {
+        trendLine[i] = currentLow;
+      } else {
+        trendLine[i] = currentLow > prevTrendVal ? currentLow : prevTrendVal;
+      }
+    } else if (dir === -1) {
+      const prevTrendVal = trendLine[i - 1];
+      const currentHigh = highs[i];
+      if (iTrend[i - 1] >= 0) {
+        trendLine[i] = currentHigh;
+      } else {
+        trendLine[i] = currentHigh < prevTrendVal ? currentHigh : prevTrendVal;
       }
     } else {
       trendLine[i] = trendLine[i - 1];
-    }
-
-    iTrend[i] = iTrend[i - 1];
-    if (trendLine[i] > trendLine[i - 1]) {
-      iTrend[i] = 1;
-    } else if (trendLine[i] < trendLine[i - 1]) {
-      iTrend[i] = -1;
     }
   }
 
@@ -329,7 +341,8 @@ export function getCoinFundingRate(symbol: string, currentBias: number): number 
 export function calculateGGShot(
   candles: Candle[],
   period: number = 80,
-  dev: number = 2.0
+  dev: number = 2.0,
+  symbol: string = 'BTC'
 ): IndicatorResult {
   const closes = candles.map(c => c.close);
   const highs = candles.map(c => c.high);
@@ -354,27 +367,39 @@ export function calculateGGShot(
   const trendLine = Array(n).fill(0);
   const iTrend = Array(n).fill(0);
 
+  if (n > 0) {
+    trendLine[0] = closes[0];
+    iTrend[0] = 0;
+  }
+
   for (let i = 1; i < n; i++) {
     const s = bbSignals[i];
+    let dir = iTrend[i - 1];
     if (s === 1) {
-      trendLine[i] = lows[i];
-      if (trendLine[i] < trendLine[i - 1]) {
-        trendLine[i] = trendLine[i - 1]; // TrendLine only rises in long mode
-      }
+      dir = 1;
     } else if (s === -1) {
-      trendLine[i] = highs[i];
-      if (trendLine[i] > trendLine[i - 1]) {
-        trendLine[i] = trendLine[i - 1]; // TrendLine only falls in short mode
+      dir = -1;
+    }
+    iTrend[i] = dir;
+
+    if (dir === 1) {
+      const prevTrendVal = trendLine[i - 1];
+      const currentLow = lows[i];
+      if (iTrend[i - 1] <= 0) {
+        trendLine[i] = currentLow;
+      } else {
+        trendLine[i] = currentLow > prevTrendVal ? currentLow : prevTrendVal;
+      }
+    } else if (dir === -1) {
+      const prevTrendVal = trendLine[i - 1];
+      const currentHigh = highs[i];
+      if (iTrend[i - 1] >= 0) {
+        trendLine[i] = currentHigh;
+      } else {
+        trendLine[i] = currentHigh < prevTrendVal ? currentHigh : prevTrendVal;
       }
     } else {
-      trendLine[i] = trendLine[i - 1]; // Hold previous value
-    }
-
-    iTrend[i] = iTrend[i - 1];
-    if (trendLine[i] > trendLine[i - 1]) {
-      iTrend[i] = 1; // Long bias
-    } else if (trendLine[i] < trendLine[i - 1]) {
-      iTrend[i] = -1; // Short bias
+      trendLine[i] = trendLine[i - 1];
     }
   }
 
@@ -383,9 +408,9 @@ export function calculateGGShot(
   for (let i = 1; i < n; i++) {
     const prev = iTrend[i - 1];
     const curr = iTrend[i];
-    if (prev === -1 && curr === 1) {
+    if (prev <= 0 && curr === 1) {
       signals[i] = 'LONG';
-    } else if (prev === 1 && curr === -1) {
+    } else if (prev >= 0 && curr === -1) {
       signals[i] = 'SHORT';
     }
   }
@@ -396,7 +421,6 @@ export function calculateGGShot(
   const { adx } = calculateADX(candles, 14);
 
   // 2. Volume Filter
-  const symbol = candles[0]?.close ? 'BTC' : 'GENERIC'; // Placeholder, actual checked in UI
   const baseVol24h = getCoinBase24hVolume(symbol);
   
   // Populate individual kline volume if empty
