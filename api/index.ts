@@ -938,10 +938,35 @@ app.get("/api/db/state", async (req, res) => {
 app.post("/api/db/state", async (req, res) => {
   if (!db) return res.json({ error: "Database not connected" });
   try {
-    const { activeTrades, closedTrades, stats, logs } = req.body;
+    const { 
+      activeTrades, 
+      closedTrades, 
+      stats, 
+      logs,
+      filterAdx,
+      filterMtf,
+      filterEma,
+      filterVolume,
+      filterFunding,
+      filterLiquidity
+    } = req.body;
     await db.collection("system_state").updateOne(
       { id: "main" },
-      { $set: { activeTrades, closedTrades, stats, logs, updatedAt: new Date() } },
+      { 
+        $set: { 
+          activeTrades, 
+          closedTrades, 
+          stats, 
+          logs, 
+          filterAdx,
+          filterMtf,
+          filterEma,
+          filterVolume,
+          filterFunding,
+          filterLiquidity,
+          updatedAt: new Date() 
+        } 
+      },
       { upsert: true }
     );
     res.json({ success: true });

@@ -144,6 +144,12 @@ export default function App() {
           if (data.closedTrades) setClosedTrades(data.closedTrades);
           if (data.stats) setStats(data.stats);
           if (data.logs) setTerminalLogs(data.logs);
+          if (data.filterAdx !== undefined) setFilterAdx(data.filterAdx);
+          if (data.filterMtf !== undefined) setFilterMtf(data.filterMtf);
+          if (data.filterEma !== undefined) setFilterEma(data.filterEma);
+          if (data.filterVolume !== undefined) setFilterVolume(data.filterVolume);
+          if (data.filterFunding !== undefined) setFilterFunding(data.filterFunding);
+          if (data.filterLiquidity !== undefined) setFilterLiquidity(data.filterLiquidity);
         }
         loadedStateDb.current = true;
       })
@@ -165,13 +171,19 @@ export default function App() {
           activeTrades,
           closedTrades,
           stats,
-          logs: terminalLogs
+          logs: terminalLogs,
+          filterAdx,
+          filterMtf,
+          filterEma,
+          filterVolume,
+          filterFunding,
+          filterLiquidity
         })
       }).catch(err => console.error("Failed to save DB state:", err));
     }, 1000); // 1-second debounce
     
     return () => clearTimeout(timeout);
-  }, [activeTrades, closedTrades, stats, terminalLogs]);
+  }, [activeTrades, closedTrades, stats, terminalLogs, filterAdx, filterMtf, filterEma, filterVolume, filterFunding, filterLiquidity]);
 
   const saveTelegramConfig = (enabled: boolean) => {
     setTgEnabled(enabled);
@@ -546,8 +558,75 @@ export default function App() {
 
   useEffect(() => {
     fetchBinanceData();
-    const interval = setInterval(fetchBinanceData, 4500); // Poll live rates every 4.5 seconds for real price action speed
-    return () => clearInterval(interval);
+    const interval = setInterval(fetchBinanceData, 8000); // Fallback REST poll for DB/relay state every 8 seconds
+
+    // Multi-Asset Real-Time Simultaneous Live WebSocket Stream
+    let ws: WebSocket | null = null;
+    let fallbackTimeout: any = null;
+    let active = true;
+
+    const connectLiveWS = () => {
+      if (!active) return;
+      try {
+        const streams = MAJOR_FUTURES.map(coin => `${coin.toLowerCase()}usdt@ticker`).join("/");
+        ws = new WebSocket(`wss://fstream.binance.com/stream?streams=${streams}`);
+        
+        ws.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload && payload.data) {
+              const tick = payload.data;
+              const coin = tick.s.replace("USDT", "");
+              const price = parseFloat(tick.c);
+              
+              setLivePrices(prev => {
+                const next = { ...prev, [coin]: price };
+                checkRealPriceExits(next);
+                return next;
+              });
+
+              // Slide real-time prices into focus candle
+              setCoinsCandles(prev => {
+                if (prev[coin]) {
+                  const list = [...prev[coin]];
+                  if (list.length > 0) {
+                    const last = { ...list[list.length - 1] };
+                    last.close = price;
+                    list[list.length - 1] = last;
+                    return { ...prev, [coin]: list };
+                  }
+                }
+                return prev;
+              });
+            }
+          } catch (_) {}
+        };
+
+        ws.onclose = () => {
+          if (active) {
+            fallbackTimeout = setTimeout(connectLiveWS, 5000);
+          }
+        };
+
+        ws.onerror = () => {
+          if (ws) ws.close();
+        };
+
+      } catch (err) {
+        if (active) {
+          fallbackTimeout = setTimeout(connectLiveWS, 5000);
+        }
+      }
+    };
+
+    connectLiveWS();
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+      if (ws) ws.close();
+      if (fallbackTimeout) clearTimeout(fallbackTimeout);
+    };
   }, []);
 
   // Initialize standard major futures coin history on mount, remaining pairs are added dynamically via price feeds
@@ -973,7 +1052,7 @@ export default function App() {
                                <input 
                                  type="text"
                                  placeholder="Search markets..."
-                                 value={searchQuery}
+                                 value={searchQuery ?? ''}
                                  onChange={(e) => setSearchQuery(e.target.value)}
                                  className="w-full bg-[#0a0d15] border border-slate-800 rounded-[5px] pl-3 pr-3 py-[7px] text-[10px] text-slate-200 placeholder-slate-600 focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/20 outline-none font-mono transition-all shadow-inner"
                                />
@@ -1046,7 +1125,7 @@ function GateSwitch({ filterVar, setter, label, value, required, pass }: any) {
       )}>
          <div className="flex items-center justify-between">
             <span className={cn("text-[9px] font-bold font-mono tracking-widest uppercase", filterVar ? (pass ? "text-slate-200" : "text-slate-200") : "text-slate-500")}>{label}</span>
-            <input type="checkbox" checked={filterVar} onChange={e => setter(e.target.checked)} className="rounded-[3px] border-slate-700 bg-slate-900 cursor-pointer h-3 w-3 focus:ring-1 focus:ring-indigo-500/50 focus:ring-offset-0 text-indigo-500 outline-none"/>
+            <input type="checkbox" checked={!!filterVar} onChange={e => setter(e.target.checked)} className="rounded-[3px] border-slate-700 bg-slate-900 cursor-pointer h-3 w-3 focus:ring-1 focus:ring-indigo-500/50 focus:ring-offset-0 text-indigo-500 outline-none"/>
          </div>
          <div className="flex items-center justify-between text-[9px] font-mono mt-0.5">
             <div className="flex flex-col gap-0.5">
