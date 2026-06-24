@@ -26,8 +26,8 @@ import {
 import { ActiveTradeCard } from './components/ActiveTradeCard';
 import { DailyPerformance } from './components/DailyPerformance';
 import { ActiveTrade, ClosedTrade } from './types';
-import { calculateGGShot } from './lib/indicators';
-import { COIN_CONFIGS, DEFAULT_CONFIG } from './lib/ggshot_1h_config';
+import { calculateSrade } from './lib/indicators';
+import { COIN_CONFIGS, DEFAULT_CONFIG } from './lib/srade_1h_config';
 import { 
   MONITORED_COINS
 } from './lib/simulation';
@@ -89,12 +89,12 @@ export default function App() {
   });
 
   // Technical Algorithmic Defence Gates Toggles (Persisted via memory)
-  const [filterAdx, setFilterAdx] = usePersistentState('ggshot_filterAdx', true);
-  const [filterMtf, setFilterMtf] = usePersistentState('ggshot_filterMtf', true);
-  const [filterEma, setFilterEma] = usePersistentState('ggshot_filterEma', true);
-  const [filterVolume, setFilterVolume] = usePersistentState('ggshot_filterVolume', true);
-  const [filterFunding, setFilterFunding] = usePersistentState('ggshot_filterFunding', true);
-  const [filterLiquidity, setFilterLiquidity] = usePersistentState('ggshot_filterLiquidity', true);
+  const [filterAdx, setFilterAdx] = usePersistentState('srade_filterAdx', true);
+  const [filterMtf, setFilterMtf] = usePersistentState('srade_filterMtf', true);
+  const [filterEma, setFilterEma] = usePersistentState('srade_filterEma', true);
+  const [filterVolume, setFilterVolume] = usePersistentState('srade_filterVolume', true);
+  const [filterFunding, setFilterFunding] = usePersistentState('srade_filterFunding', true);
+  const [filterLiquidity, setFilterLiquidity] = usePersistentState('srade_filterLiquidity', true);
 
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
 
@@ -157,6 +157,48 @@ export default function App() {
         console.error("Failed to load DB state:", err);
         loadedStateDb.current = true;
       });
+  }, []);
+
+  const closedTradesRef = useRef<ClosedTrade[]>([]);
+  useEffect(() => {
+    closedTradesRef.current = closedTrades;
+  }, [closedTrades]);
+
+  // Periodic state sync from DB (for backend-generated trades)
+  useEffect(() => {
+    const syncInterval = setInterval(() => {
+      if (!loadedStateDb.current) return;
+      fetch('/api/db/state')
+        .then(res => res.json())
+        .then(data => {
+          if (!data.error) {
+            if (data.activeTrades) {
+              setActiveTrades(prev => {
+                const prevIds = new Set(prev.map(t => t.id));
+                const closedIds = new Set(closedTradesRef.current.map(t => t.id));
+                const newTrades = data.activeTrades.filter((t: any) => !prevIds.has(t.id) && !closedIds.has(t.id));
+                
+                if (newTrades.length > 0) {
+                   return [...prev, ...newTrades];
+                }
+                return prev;
+              });
+            }
+            if (data.logs) {
+              setTerminalLogs(prev => {
+                const prevSet = new Set(prev);
+                const newLogs = data.logs.filter((l: string) => !prevSet.has(l));
+                if (newLogs.length > 0) {
+                  return [...newLogs, ...prev].slice(0, 40);
+                }
+                return prev;
+              });
+            }
+          }
+        })
+        .catch(console.error);
+    }, 5000);
+    return () => clearInterval(syncInterval);
   }, []);
 
   // Sync state to DB on change
@@ -229,7 +271,7 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          message: `🛡️ <b>GG-SHOT Connection Verified!</b>\n\nYour Discord / Telegram notification bridge is live!\n⏰ <b>Time:</b> ${new Date().toLocaleString()}\n🟢 This channel will now monitor all breakout signals and scaling events.`
+          message: `🛡️ <b>Srade Connection Verified!</b>\n\nYour Discord / Telegram notification bridge is live!\n⏰ <b>Time:</b> ${new Date().toLocaleString()}\n🟢 This channel will now monitor all breakout signals and scaling events.`
         })
       });
       const data = await response.json();
@@ -317,7 +359,7 @@ export default function App() {
         persistTradeUpdate(trade.dbId, slBound, finalPercent, 'LOSS');
 
         sendTelegramNotification(
-          `🚨 <b>GG-SHOT Stop Loss Hit</b>\n` +
+          `🚨 <b>Srade Stop Loss Hit</b>\n` +
           `🆔 <b>trade id:</b> ${displayId}\n` +
           `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
           `📉 <b>Event:</b> Position hit Stop Loss bound\n` +
@@ -362,7 +404,7 @@ export default function App() {
         persistTradeUpdate(trade.dbId, currentPrice, finalPercent, status);
 
         sendTelegramNotification(
-          `🔄 <b>GG-SHOT Trend Reversal Exit</b>\n` +
+          `🔄 <b>Srade Trend Reversal Exit</b>\n` +
           `🆔 <b>trade id:</b> ${displayId}\n` +
           `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
           `⚠️ <b>Event:</b> Trend inverted. Safety scale-out executed.\n` +
@@ -403,7 +445,7 @@ export default function App() {
           writeLog(`[PARTIAL TP${i+1} HIT] ${trade.symbol} scaled out ${alloc[i]}% of units at ${formatPrice(targetPrice)}!`);
           
           sendTelegramNotification(
-            `🎯 <b>GG-SHOT Take Profit Achieved!</b>\n` +
+            `🎯 <b>Srade Take Profit Achieved!</b>\n` +
             `🆔 <b>trade id:</b> ${displayId}\n` +
             `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
             `📈 <b>Milestone:</b> Take Profit #${i+1} reached successfully! 🎉\n` +
@@ -459,7 +501,7 @@ export default function App() {
         persistTradeUpdate(trade.dbId, trade.tps[3], finalPercent, 'WIN');
 
         sendTelegramNotification(
-          `🏆 <b>GG-SHOT Cycle Fully Achieved!</b>\n` +
+          `🏆 <b>Srade Cycle Fully Achieved!</b>\n` +
           `🆔 <b>trade id:</b> ${displayId}\n` +
           `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
           `🏁 <b>Event:</b> Ultimate Take Profit #4 hit - full position realized!\n` +
@@ -632,7 +674,7 @@ export default function App() {
   // Initialize standard major futures coin history on mount, remaining pairs are added dynamically via price feeds
   useEffect(() => {
     const initializeAll = async () => {
-      writeLog("SYSTEM INITIALIZATION: Connecting GG-SHOT Bollinger-Trendline engine...");
+      writeLog("SYSTEM INITIALIZATION: Connecting Srade Bollinger-Trendline engine...");
       writeLog("SYNCING MARKET DATA: Fetching 300h candle histories directly from Binance Futures API...");
       const initialCandles: Record<string, any[]> = {};
       
@@ -691,7 +733,7 @@ export default function App() {
   
   const ggResult = useMemo(() => {
     if (candleData.length === 0) return null;
-    return calculateGGShot(candleData, coinConfig.bbPeriod, coinConfig.bbDev, selectedCoin);
+    return calculateSrade(candleData, coinConfig.bbPeriod, coinConfig.bbDev, selectedCoin);
   }, [candleData, coinConfig.bbPeriod, coinConfig.bbDev, selectedCoin]);
 
   const winRate = stats.won + stats.lost > 0 
@@ -732,7 +774,7 @@ export default function App() {
       {/* 1. Slim Left Sidebar */}
       <aside className="w-[60px] lg:w-[68px] border-r border-slate-800/80 bg-[#0A0D14] flex flex-col items-center py-5 shrink-0 hidden md:flex z-50">
          <div className="flex flex-col items-center gap-6 w-full">
-            <div className="h-9 w-9 rounded-xl bg-indigo-500/10 text-indigo-400 flex items-center justify-center font-black shadow-[0_0_10px_rgba(99,102,241,0.05)] ring-1 ring-indigo-500/20 text-sm">GG</div>
+            <div className="h-9 w-9 rounded-xl bg-indigo-500/10 text-indigo-400 flex items-center justify-center font-black shadow-[0_0_10px_rgba(99,102,241,0.05)] ring-1 ring-indigo-500/20 text-sm">SR</div>
             <nav className="flex flex-col gap-3 text-slate-500 w-full px-2 lg:px-3">
                <button className="p-2.5 bg-indigo-500/10 text-indigo-400 rounded-lg transition-colors border border-indigo-500/10 flex justify-center w-full shadow-inner"><Activity size={18}/></button>
                <button className="p-2.5 hover:bg-slate-800/60 hover:text-slate-300 rounded-lg transition-colors flex justify-center w-full"><TrendingUp size={18}/></button>
@@ -751,7 +793,7 @@ export default function App() {
          {/* Top Institutional Header */}
          <header className="h-[52px] border-b border-slate-800/80 bg-[#0A0D14]/90 flex items-center justify-between px-4 lg:px-6 shrink-0 z-40">
              <div className="flex items-center gap-5">
-                 <h1 className="font-display text-[15px] font-bold text-slate-100 flex items-center gap-2 tracking-tight">GG-SHOT <span className="px-1.5 py-[3px] bg-indigo-500/15 text-indigo-400 text-[9px] uppercase tracking-widest rounded font-black border border-indigo-500/20 leading-none">PRO</span></h1>
+                 <h1 className="font-display text-[15px] font-bold text-slate-100 flex items-center gap-2 tracking-tight">Srade <span className="px-1.5 py-[3px] bg-indigo-500/15 text-indigo-400 text-[9px] uppercase tracking-widest rounded font-black border border-indigo-500/20 leading-none">PRO</span></h1>
                  <div className="h-4 w-px bg-slate-800/80 hidden sm:block"></div>
                  <div className="hidden sm:flex items-center gap-2">
                     <span className="h-1.5 w-1.5 rounded-full border border-slate-900 outline flex bg-emerald-500 outline-emerald-500/30 animate-pulse"></span>
@@ -827,27 +869,27 @@ export default function App() {
                        {ggResult && (
                            <div className="grid grid-cols-2 lg:grid-cols-4 border-b border-slate-800/60 divide-x divide-y divide-slate-800/60 lg:divide-y-0 text-center font-mono">
                                <div className="py-2.5 px-3 bg-[#0a0d14]/40">
-                                   <div className="text-[9px] text-slate-500 font-bold tracking-widest uppercase mb-1">iTrend Bias</div>
-                                   <div className={cn("text-[11px] font-bold", ggResult.iTrend[ggResult.iTrend.length-1] === 1 ? "text-emerald-400" : ggResult.iTrend[ggResult.iTrend.length-1] === -1 ? "text-rose-400" : "text-slate-500")}>
-                                      {ggResult.iTrend[ggResult.iTrend.length - 1] === 1 ? "BULLISH" : ggResult.iTrend[ggResult.iTrend.length - 1] === -1 ? "BEARISH" : "NEUTRAL"}
+                                   <div className="text-[9px] text-slate-500 font-bold tracking-widest uppercase mb-1">RSI (14)</div>
+                                   <div className={cn("text-[11px] font-bold", (ggResult.rsi?.[ggResult.rsi.length - 1] ?? 50) < 30 ? "text-emerald-400 font-extrabold animate-pulse" : (ggResult.rsi?.[ggResult.rsi.length - 1] ?? 50) > 70 ? "text-rose-400 font-extrabold animate-pulse" : "text-slate-300")}>
+                                      {(ggResult.rsi?.[ggResult.rsi.length - 1] ?? 50).toFixed(2)}{(ggResult.rsi?.[ggResult.rsi.length - 1] ?? 50) < 30 ? " (OVERSOLD)" : (ggResult.rsi?.[ggResult.rsi.length - 1] ?? 50) > 70 ? " (OVERBOUGHT)" : ""}
                                    </div>
                                </div>
                                <div className="py-2.5 px-3 bg-[#0a0d14]/40">
-                                   <div className="text-[9px] text-slate-500 font-bold tracking-widest uppercase mb-1">Trendline Value</div>
-                                   <div className="text-[11px] font-bold text-slate-300">
-                                      {formatPrice(ggResult.trendLine[ggResult.trendLine.length - 1] || 0)}
+                                   <div className="text-[9px] text-slate-500 font-bold tracking-widest uppercase mb-1">MACD Histogram</div>
+                                   <div className={cn("text-[11px] font-bold", ggResult.macdColors?.[ggResult.macdColors.length - 1] === 'deep_green' ? "text-emerald-400" : ggResult.macdColors?.[ggResult.macdColors.length - 1] === 'light_green' ? "text-emerald-300/80" : ggResult.macdColors?.[ggResult.macdColors.length - 1] === 'deep_red' ? "text-rose-500" : ggResult.macdColors?.[ggResult.macdColors.length - 1] === 'light_red' ? "text-rose-400/80" : "text-slate-400")}>
+                                      {(ggResult.macdHist?.[ggResult.macdHist.length - 1] ?? 0).toFixed(4)}
                                    </div>
                                </div>
                                <div className="py-2.5 px-3 bg-[#0a0d14]/40">
-                                   <div className="text-[9px] text-slate-500 font-bold tracking-widest uppercase mb-1">BB Signal Alert</div>
-                                   <div className={cn("text-[11px] font-bold", ggResult.bbSignals[ggResult.bbSignals.length - 1] === 1 ? "text-amber-400" : ggResult.bbSignals[ggResult.bbSignals.length - 1] === -1 ? "text-sky-400" : "text-slate-500")}>
-                                      {ggResult.bbSignals[ggResult.bbSignals.length - 1] === 1 ? "OVERBOUGHT" : ggResult.bbSignals[ggResult.bbSignals.length - 1] === -1 ? "OVERSOLD" : "NORMAL"}
+                                   <div className="text-[9px] text-slate-500 font-bold tracking-widest uppercase mb-1">ATR (14) Volatility</div>
+                                   <div className="text-[11px] font-bold text-amber-400">
+                                      {ggResult.atr?.[ggResult.atr.length - 1] ? "$" + (ggResult.atr[ggResult.atr.length - 1] as number).toFixed(2) : 'N/A'}
                                    </div>
                                </div>
                                <div className="py-2.5 px-3 bg-[#0a0d14]/40">
-                                   <div className="text-[9px] text-slate-500 font-bold tracking-widest uppercase mb-1">BB SMA ({coinConfig.bbPeriod})</div>
+                                   <div className="text-[9px] text-slate-500 font-bold tracking-widest uppercase mb-1">Target Setup Rule</div>
                                    <div className="text-[11px] font-bold text-indigo-400">
-                                      {ggResult.mid[ggResult.mid.length - 1] ? formatPrice(ggResult.mid[ggResult.mid.length - 1] as number) : 'N/A'}
+                                      1.5x ATR SL / 2:1 R:R
                                    </div>
                                </div>
                            </div>
@@ -876,8 +918,8 @@ export default function App() {
                                          <div className="w-px bg-slate-800/50 h-full absolute bottom-0 left-1/2 opacity-20 pointer-events-none"></div>
                                          {signal && (
                                            <div className={cn(
-                                             "absolute -top-5 left-1/2 -translate-x-1/2 text-[8px] font-mono leading-none tracking-tight px-[5px] py-[3px] rounded font-black z-20 shadow-md",
-                                             signal === 'LONG' ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" : "bg-rose-500/20 text-rose-400 border border-rose-500/30"
+                                             "absolute top-2 left-1/2 -translate-x-1/2 text-[9px] font-mono leading-none tracking-tight px-1.5 py-1 rounded font-black z-30 shadow-lg border-2 animate-pulse",
+                                             signal === 'LONG' ? "bg-emerald-500/30 text-emerald-300 border-emerald-500/50" : "bg-rose-500/30 text-rose-300 border-rose-500/50"
                                            )}>
                                              {signal}
                                            </div>
@@ -885,7 +927,7 @@ export default function App() {
                                          <div className="hidden group-hover:flex flex-col absolute bottom-full mb-2 bg-[#1a2130] border border-slate-700 text-slate-200 text-[9px] font-mono p-2 rounded shadow-2xl z-30 whitespace-nowrap leading-tight gap-1">
                                            <div className="text-slate-400 pb-1 border-b border-slate-700 font-bold uppercase tracking-widest text-[8px] text-center">Interval Data</div>
                                            <div className="flex justify-between gap-3 mt-1">C:<span className={isGreen ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>{formatPrice(candle.close)}</span></div>
-                                           <div className="flex justify-between gap-3">T:<span className="text-slate-300 font-bold">{ggResult?.trendLine[absoluteIdx]?.toFixed(4)}</span></div>
+                                           <div className="flex justify-between gap-3">RSI:<span className="text-slate-300 font-bold">{ggResult?.rsi?.[absoluteIdx]?.toFixed(2) || 'N/A'}</span></div>
                                          </div>
                                          <div 
                                             className={cn("w-full rounded-[1px] relative z-10 transition-all opacity-90 hover:opacity-100", isGreen ? "bg-emerald-500" : "bg-rose-500")}
@@ -906,10 +948,10 @@ export default function App() {
                           </div>
                        )}
                        <div className="bg-[#0b0e14] border-t border-slate-800/60 p-2.5 grid grid-cols-2 md:grid-cols-4 gap-2 text-[9px] font-mono divide-x divide-slate-800/60 text-center uppercase tracking-widest shadow-inner">
-                          <div><span className="text-slate-500">PERIOD:</span> <span className="ml-1 text-slate-300 font-bold">{coinConfig.bbPeriod}</span></div>
-                          <div><span className="text-slate-500">DEV:</span> <span className="ml-1 text-slate-300 font-bold">{coinConfig.bbDev.toFixed(1)}</span></div>
+                          <div><span className="text-slate-500">ASSET:</span> <span className="ml-1 text-slate-300 font-bold">BTC ONLY</span></div>
+                          <div><span className="text-slate-500">TIMEFRAME:</span> <span className="ml-1 text-slate-300 font-bold">1H ONLY</span></div>
                           <div><span className="text-slate-500">RISK:</span> <span className="ml-1 text-slate-300 font-bold">{coinConfig.risk}%</span></div>
-                          <div className="flex items-center justify-center gap-1"><span className="text-slate-500">TP TARGETS:</span> <span className="text-emerald-400 font-bold">{coinConfig.tp.map(t => `${t}%`).join(' ➜ ')}</span></div>
+                          <div className="flex items-center justify-center gap-1"><span className="text-slate-500">TP MODULES:</span> <span className="text-emerald-400 font-bold">0.5x ➜ 1.0x ➜ 1.5x ➜ 2.0x ATR</span></div>
                        </div>
                    </div>
 

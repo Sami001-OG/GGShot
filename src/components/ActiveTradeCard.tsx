@@ -2,7 +2,7 @@ import { motion } from 'motion/react';
 import { Target, ShieldAlert, CheckCircle2, Circle, TrendingUp, TrendingDown, DollarSign } from 'lucide-react';
 import { ActiveTrade } from '../types';
 import { cn, formatPrice, formatPercent } from '../lib/utils';
-import { COIN_CONFIGS } from '../lib/ggshot_1h_config';
+import { COIN_CONFIGS } from '../lib/srade_1h_config';
 
 interface ActiveTradeCardProps {
   key?: string | number;

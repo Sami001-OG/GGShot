@@ -1,5 +1,5 @@
 /**
- * GG-SHOT Strategy Config (ggshot_1h_config.py exact replication)
+ * Srade Strategy Config (srade_1h_config.py exact replication)
  * Custom optimization configs for tracked Binance Futures pairs
  */
 

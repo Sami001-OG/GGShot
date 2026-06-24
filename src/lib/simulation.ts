@@ -1,5 +1,5 @@
 import { ActiveTrade, TradeDirection } from '../types';
-import { COIN_CONFIGS, DEFAULT_CONFIG } from './ggshot_1h_config';
+import { COIN_CONFIGS, DEFAULT_CONFIG } from './srade_1h_config';
 import { Candle, getCoinBase24hVolume } from './indicators';
 
 export interface CoinMetadata {
@@ -9,17 +9,7 @@ export interface CoinMetadata {
 }
 
 export const MONITORED_COINS: CoinMetadata[] = [
-  { name: 'BTC', price: 69250, winRate: 0.55 },
-  { name: 'ETH', price: 3740, winRate: 0.58 },
-  { name: 'SOL', price: 165, winRate: 0.62 },
-  { name: 'APE', price: 1.32, winRate: 0.65 },
-  { name: 'SUI', price: 1.82, winRate: 0.61 },
-  { name: 'DOGE', price: 0.145, winRate: 0.57 },
-  { name: 'PEPE', price: 0.000012, winRate: 0.68 },
-  { name: 'WIF', price: 2.89, winRate: 0.64 },
-  { name: 'XRP', price: 0.58, winRate: 0.59 },
-  { name: 'ADA', price: 0.44, winRate: 0.56 },
-  { name: 'TIA', price: 19.5, winRate: 0.58 }
+  { name: 'BTC', price: 69250, winRate: 0.55 }
 ];
 
 let idCounter = 1;

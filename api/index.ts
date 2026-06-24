@@ -5,8 +5,8 @@ import dotenv from "dotenv";
 import { MongoClient } from "mongodb";
 import mongoose from "mongoose";
 import WebSocket from "ws";
-import { calculateGGShot, getCoinFundingRate, getCoinBase24hVolume, aggregateTo4Hour, calculateITrendOnly } from "../src/lib/indicators.js";
-import { COIN_CONFIGS, DEFAULT_CONFIG } from "../src/lib/ggshot_1h_config.js";
+import { calculateSrade, getCoinFundingRate, getCoinBase24hVolume, aggregateTo4Hour, calculateITrendOnly } from "../src/lib/indicators.js";
+import { COIN_CONFIGS, DEFAULT_CONFIG } from "../src/lib/srade_1h_config.js";
 
 dotenv.config();
 
@@ -105,7 +105,7 @@ if (mongoUri) {
   // Original DB setup
   const client = new MongoClient(mongoUri);
   client.connect().then(() => {
-    db = client.db("GG-Shot");
+    db = client.db("Srade");
     console.log("Connected to MongoDB successfully via standard driver.");
     // Start WebSocket Screener once DB is connected!
     startWebSocketScreener();
@@ -116,7 +116,7 @@ if (mongoUri) {
   });
 
   // Mongoose setup
-  mongoose.connect(mongoUri, { dbName: "GG-Shot" }).then(() => {
+  mongoose.connect(mongoUri, { dbName: "Srade" }).then(() => {
     console.log("Connected to Mongoose successfully for Trades tracking.");
   }).catch(err => {
     console.error("Mongoose connection failed:", err);
@@ -210,7 +210,7 @@ async function updateCoinCandleCacheAndCheck(coin: string, k: any) {
   }
 
   const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
-  const resList = calculateGGShot(candles, config.bbPeriod, config.bbDev, coin);
+  const resList = calculateSrade(candles, config.bbPeriod, config.bbDev, coin);
 
   const targetIdx = candles.length - 1;
   const signal = resList.signals[targetIdx];
@@ -276,8 +276,8 @@ async function updateCoinCandleCacheAndCheck(coin: string, k: any) {
     filterLiquidity: state.filterLiquidity !== undefined ? state.filterLiquidity : true,
   };
 
-  if (filters.filterAdx && adxVal <= 25) {
-    const log = `[CONFLUENCE REJECT] ${coin} ${signal} @ $${entryPrice} blocked: ADX sideways (${adxVal.toFixed(1)} <= 25)`;
+  if (filters.filterAdx && adxVal <= 20) {
+    const log = `[CONFLUENCE REJECT] ${coin} ${signal} @ $${entryPrice} blocked: ADX sideways (${adxVal.toFixed(1)} <= 20)`;
     logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
     state.logs = logs.slice(0, 40);
     await saveSystemState(state);
@@ -367,31 +367,28 @@ async function updateCoinCandleCacheAndCheck(coin: string, k: any) {
 
   lastTradeCandleTime.set(coin, candleStartTime);
 
-  const p1 = config.tp[0];
-  const p2 = config.tp[1];
-  const p3 = config.tp[2];
-  const p4 = config.tp[3];
-  const slPct = config.sl;
+  const currentAtr = resList.atr[targetIdx] || (entryPrice * 0.015);
+  const slDistance = 1.5 * currentAtr;
 
   let tps: [number, number, number, number];
   let sl: number;
 
   if (signal === 'LONG') {
+    sl = entryPrice - slDistance;
     tps = [
-      entryPrice * (1 + p1 / 100),
-      entryPrice * (1 + p2 / 100),
-      entryPrice * (1 + p3 / 100),
-      entryPrice * (1 + p4 / 100)
+      entryPrice + 0.5 * slDistance,
+      entryPrice + 1.0 * slDistance,
+      entryPrice + 1.5 * slDistance,
+      entryPrice + 2.0 * slDistance
     ];
-    sl = entryPrice * (1 - slPct / 100);
   } else {
+    sl = entryPrice + slDistance;
     tps = [
-      entryPrice * (1 - p1 / 100),
-      entryPrice * (1 - p2 / 100),
-      entryPrice * (1 - p3 / 100),
-      entryPrice * (1 - p4 / 100)
+      entryPrice - 0.5 * slDistance,
+      entryPrice - 1.0 * slDistance,
+      entryPrice - 1.5 * slDistance,
+      entryPrice - 2.0 * slDistance
     ];
-    sl = entryPrice * (1 + slPct / 100);
   }
 
   const baseSize = 10000 * 0.02 * config.risk * 3;
@@ -546,7 +543,7 @@ function processTradeUpdateServerLogic(
     loggedMsg = `[STOP LOSS HIT] ${trade.symbol} ${trade.direction} hit SL at ${formatPrice(slBound)}! Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`;
 
     sendTelegramMessage(
-      `🚨 <b>GG-SHOT Stop Loss Hit</b>\n\n` +
+      `🚨 <b>Srade Stop Loss Hit</b>\n\n` +
       `🆔 <b>trade id:</b> ${displayId}\n` +
       `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
       `📉 <b>Event:</b> Position hit Stop Loss bound\n` +
@@ -583,7 +580,7 @@ function processTradeUpdateServerLogic(
     loggedMsg = `[REVERSAL EXIT] ${trade.symbol} ${trade.direction} trend flipped! Exited remaining at ${formatPrice(currentPrice)}. Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`;
 
     sendTelegramMessage(
-      `🔄 <b>GG-SHOT Trend Reversal Exit</b>\n\n` +
+      `🔄 <b>Srade Trend Reversal Exit</b>\n\n` +
       `🆔 <b>trade id:</b> ${displayId}\n` +
       `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
       `⚠️ <b>Event:</b> Trend inverted. Safety scale-out executed.\n` +
@@ -618,7 +615,7 @@ function processTradeUpdateServerLogic(
       loggedMsg = `[PARTIAL TP${i+1} HIT] ${trade.symbol} scaled out ${alloc[i]}% of units at ${formatPrice(targetPrice)}!`;
       
       sendTelegramMessage(
-        `🎯 <b>GG-SHOT Take Profit Achieved!</b>\n\n` +
+        `🎯 <b>Srade Take Profit Achieved!</b>\n\n` +
         `🆔 <b>trade id:</b> ${displayId}\n` +
         `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
         `📈 <b>Milestone:</b> Take Profit #${i+1} reached successfully! 🎉\n` +
@@ -662,7 +659,7 @@ function processTradeUpdateServerLogic(
     loggedMsg = `[TP4 COMPLETED] ${trade.symbol} target cycle achieved! Net PnL: +${finalPercent.toFixed(2)}%`;
 
     sendTelegramMessage(
-      `🏆 <b>GG-SHOT Cycle Fully Achieved!</b>\n\n` +
+      `🏆 <b>Srade Cycle Fully Achieved!</b>\n\n` +
       `🆔 <b>trade id:</b> ${displayId}\n` +
       `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
       `🏁 <b>Event:</b> Ultimate Take Profit #4 hit - full position realized!\n` +
@@ -790,7 +787,7 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
 
     // Run technical indicators
     const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
-    const resList = calculateGGShot(candles, config.bbPeriod, config.bbDev, coin);
+    const resList = calculateSrade(candles, config.bbPeriod, config.bbDev, coin);
     
     // Match closed candle
     let targetIdx = candles.length - 2;
@@ -959,32 +956,28 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
       return;
     }
 
-    // Parameters set
-    const p1 = config.tp[0];
-    const p2 = config.tp[1];
-    const p3 = config.tp[2];
-    const p4 = config.tp[3];
-    const slPct = config.sl;
+    const currentAtr = resList.atr[targetIdx] || (entryPrice * 0.015);
+    const slDistance = 1.5 * currentAtr;
 
     let tps: [number, number, number, number];
     let sl: number;
 
     if (signal === 'LONG') {
+      sl = entryPrice - slDistance;
       tps = [
-        entryPrice * (1 + p1 / 100),
-        entryPrice * (1 + p2 / 100),
-        entryPrice * (1 + p3 / 100),
-        entryPrice * (1 + p4 / 100)
+        entryPrice + 0.5 * slDistance,
+        entryPrice + 1.0 * slDistance,
+        entryPrice + 1.5 * slDistance,
+        entryPrice + 2.0 * slDistance
       ];
-      sl = entryPrice * (1 - slPct / 100);
     } else {
+      sl = entryPrice + slDistance;
       tps = [
-        entryPrice * (1 - p1 / 100),
-        entryPrice * (1 - p2 / 100),
-        entryPrice * (1 - p3 / 100),
-        entryPrice * (1 - p4 / 100)
+        entryPrice - 0.5 * slDistance,
+        entryPrice - 1.0 * slDistance,
+        entryPrice - 1.5 * slDistance,
+        entryPrice - 2.0 * slDistance
       ];
-      sl = entryPrice * (1 + slPct / 100);
     }
 
     const baseSize = 10000 * 0.02 * config.risk * 3;
@@ -1333,14 +1326,38 @@ app.post("/api/db/state", async (req, res) => {
       filterFunding,
       filterLiquidity
     } = req.body;
+
+    const currentState = await db.collection("system_state").findOne({ id: "main" });
+    let mergedActiveTrades = activeTrades || [];
+    let mergedLogs = logs || [];
+    
+    if (currentState) {
+      if (currentState.activeTrades) {
+        const frontendActiveIds = new Set((activeTrades || []).map((t: any) => t.id));
+        const frontendClosedIds = new Set((closedTrades || []).map((t: any) => t.id));
+        
+        const unseenBackendTrades = currentState.activeTrades.filter((t: any) => 
+          !frontendActiveIds.has(t.id) && !frontendClosedIds.has(t.id)
+        );
+        
+        mergedActiveTrades = [...mergedActiveTrades, ...unseenBackendTrades];
+      }
+      
+      if (currentState.logs) {
+         const frontendLogsSet = new Set(logs || []);
+         const unseenBackendLogs = currentState.logs.filter((l: string) => !frontendLogsSet.has(l));
+         mergedLogs = [...unseenBackendLogs, ...mergedLogs].slice(0, 40);
+      }
+    }
+
     await db.collection("system_state").updateOne(
       { id: "main" },
       { 
         $set: { 
-          activeTrades, 
+          activeTrades: mergedActiveTrades, 
           closedTrades, 
           stats, 
-          logs, 
+          logs: mergedLogs, 
           filterAdx,
           filterMtf,
           filterEma,
@@ -1391,22 +1408,78 @@ async function runMarketScan() {
 
         // Run technical analysis
         const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
-        const resList = calculateGGShot(candles, config.bbPeriod, config.bbDev, coin);
+        const resList = calculateSrade(candles, config.bbPeriod, config.bbDev, coin);
         
         const targetIdx = candles.length - 2;
+        const candleTime = candles[targetIdx].time;
+        const processedKey = `${coin}_cron_${candleTime}`;
+        if (processedClosedKlines.has(processedKey)) return;
+
         const signal = resList.signals[targetIdx];
         const adxVal = resList.adx[targetIdx] ?? 0;
         const ema200val = resList.ema200_4h[targetIdx] ?? candles[targetIdx].close;
 
         if (signal) {
-          // Strong filter rejection: ADX must be > 25 for strong trend
-          if (adxVal > 25) {
+          const state = await getSystemState();
+          const filterAdxEnabled = state?.filterAdx !== false;
+          const filterEmaEnabled = state?.filterEma !== false;
+
+          // ADX filter rejection
+          if (!filterAdxEnabled || adxVal > 20) {
             const closePrice = candles[targetIdx].close;
             // 4H EMA 200 filter check
-            if ((signal === 'LONG' && closePrice > ema200val) || (signal === 'SHORT' && closePrice < ema200val)) {
+            if (!filterEmaEnabled || (signal === 'LONG' && closePrice > ema200val) || (signal === 'SHORT' && closePrice < ema200val)) {
               triggeredSignals++;
-              const msg = `⚡ <b>SYSTEM SCANNER (Autonomous Engine)</b>\n\n🎯 <b>${coin}USDT</b> | <b>${signal} TRIGGERED</b>\n\n💰 Entry Price: ${closePrice}\n📊 ADX: ${adxVal.toFixed(1)}${adxVal > 25 ? ' (STRONG TREND)' : ''}\n📈 4H EMA 200 Trend Check: PASS\n\n<i>This signal was processed securely via background task without frontend.</i>`;
-              await sendTelegramMessage(msg, signal);
+              processedClosedKlines.add(processedKey);
+              
+              if (state) {
+                const activeTrades = [...(state.activeTrades || [])];
+                const existingIndex = activeTrades.findIndex((t: any) => t.symbol === coin);
+                
+                if (existingIndex === -1) {
+                  const currentAtr = resList.atr[targetIdx] || (closePrice * 0.015);
+                  const slDistance = 1.5 * currentAtr;
+                  let tps: [number, number, number, number];
+                  let sl: number;
+                  if (signal === 'LONG') {
+                    sl = closePrice - slDistance;
+                    tps = [closePrice + 0.5 * slDistance, closePrice + 1.0 * slDistance, closePrice + 1.5 * slDistance, closePrice + 2.0 * slDistance];
+                  } else {
+                    sl = closePrice + slDistance;
+                    tps = [closePrice - 0.5 * slDistance, closePrice - 1.0 * slDistance, closePrice - 1.5 * slDistance, closePrice - 2.0 * slDistance];
+                  }
+
+                  const baseSize = 10000 * 0.02 * config.risk * 3;
+                  const now = new Date();
+                  const dateKey = `${String(now.getUTCDate()).padStart(2, '0')}${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+                  const count = await getNextTradeCount(dateKey);
+                  const tradeId = `${dateKey}${String(count).padStart(2, '0')}`;
+
+                  const tradeRecord = new TradeModel({
+                    tradeId, symbol: coin, direction: signal, entryPrice: closePrice, status: "OPEN", pnlPercent: 0
+                  });
+                  await tradeRecord.save();
+
+                  const newTrade: any = {
+                    id: Math.random().toString(36).substring(2, 7).toUpperCase(),
+                    dbId: tradeId, symbol: coin, direction: signal, entry: closePrice, tp: tps[0], tps, sl, currentPrice: closePrice,
+                    size: baseSize, risk: config.risk, realizedTps: [false, false, false, false], initialSize: baseSize, partialPnlRealized: 0
+                  };
+
+                  activeTrades.push(newTrade);
+                  state.activeTrades = activeTrades;
+                  
+                  const logs = state.logs || [];
+                  const successMsg = `>>> SYSTEM SCANNER TRIGGER: ${coin} ${signal} @ $${formatPrice(closePrice)} generated! Trade ${tradeId} recorded.`;
+                  logs.unshift(`[${new Date().toLocaleTimeString()}] ${successMsg}`);
+                  state.logs = logs.slice(0, 40);
+
+                  await saveSystemState(state);
+
+                  const msg = `⚡ <b>SYSTEM SCANNER (Autonomous Engine)</b>\n\n🎯 <b>${coin}USDT</b> | <b>${signal} TRIGGERED</b>\n\n💰 Entry Price: ${closePrice}\n📊 ADX: ${adxVal.toFixed(1)}${adxVal > 20 ? ' (STRONG TREND)' : ''}\n📈 4H EMA 200 Trend Check: PASS\n\n<i>This signal was processed securely via background task.</i>`;
+                  await sendTelegramMessage(msg, signal);
+                }
+              }
             }
           }
         }

@@ -1,5 +1,5 @@
 /**
- * GG-SHOT Strategy Indicators
+ * Srade Strategy Indicators
  * Exact TypeScript implementation of PineScript v5 Core Logic
  */
 
@@ -38,6 +38,14 @@ export interface IndicatorResult {
   fundingRate: number;      // Current Funding Rate in % (e.g. 0.015%)
   volume24hUsdt: number;    // Simulated or actual 24H volume of asset in USDT
   ema200_4h: (number | null)[];
+
+  // New Strategy Fields
+  rsi: number[];
+  macdLine: number[];
+  signalLine: number[];
+  macdHist: number[];
+  macdColors: string[];
+  atr: number[];
 }
 
 // 2b. Standard Deviation (STDEV)
@@ -337,8 +345,134 @@ export function getCoinFundingRate(symbol: string, currentBias: number): number 
   return 0.010 + wave * 0.005;
 }
 
+// Standard Relative Strength Index (RSI) calculation
+export function calculateRSI(closes: number[], period: number = 14): number[] {
+  const n = closes.length;
+  const rsi = Array(n).fill(50);
+  if (n <= period) return rsi;
+
+  const gains = Array(n).fill(0);
+  const losses = Array(n).fill(0);
+
+  for (let i = 1; i < n; i++) {
+    const diff = closes[i] - closes[i - 1];
+    gains[i] = diff > 0 ? diff : 0;
+    losses[i] = diff < 0 ? -diff : 0;
+  }
+
+  let avgGain = gains.slice(1, period + 1).reduce((sum, val) => sum + val, 0) / period;
+  let avgLoss = losses.slice(1, period + 1).reduce((sum, val) => sum + val, 0) / period;
+
+  if (avgLoss === 0) {
+    rsi[period] = 100;
+  } else {
+    rsi[period] = 100 - 100 / (1 + avgGain / avgLoss);
+  }
+
+  for (let i = period + 1; i < n; i++) {
+    avgGain = (avgGain * (period - 1) + gains[i]) / period;
+    avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
+
+    if (avgLoss === 0) {
+      rsi[i] = 100;
+    } else {
+      rsi[i] = 100 - 100 / (1 + avgGain / avgLoss);
+    }
+  }
+
+  for (let i = 0; i < period; i++) {
+    rsi[i] = rsi[period];
+  }
+
+  return rsi;
+}
+
+// Moving Average Convergence Divergence (MACD) calculation with Histogram Colors
+export function calculateMACD(
+  closes: number[],
+  fast: number = 12,
+  slow: number = 26,
+  signal: number = 9
+): { macdLine: number[]; signalLine: number[]; histogram: number[]; colors: string[] } {
+  const n = closes.length;
+  const macdLine = Array(n).fill(0);
+  const signalLine = Array(n).fill(0);
+  const histogram = Array(n).fill(0);
+  const colors = Array(n).fill('neutral');
+
+  const fastEma = ema(closes, fast);
+  const slowEma = ema(closes, slow);
+
+  for (let i = 0; i < n; i++) {
+    const f = fastEma[i];
+    const s = slowEma[i];
+    if (f !== null && s !== null) {
+      macdLine[i] = f - s;
+    }
+  }
+
+  // Calculate Signal Line (EMA 9 of MACD Line)
+  const sigEma = ema(macdLine, signal);
+  for (let i = 0; i < n; i++) {
+    const sig = sigEma[i];
+    if (sig !== null) {
+      signalLine[i] = sig;
+      histogram[i] = macdLine[i] - sig;
+    }
+  }
+
+  // Define MACD Histogram Colors
+  for (let i = 1; i < n; i++) {
+    const prevH = histogram[i - 1];
+    const currH = histogram[i];
+    if (currH > 0) {
+      colors[i] = currH > prevH ? 'deep_green' : 'light_green';
+    } else if (currH < 0) {
+      colors[i] = currH < prevH ? 'deep_red' : 'light_red';
+    } else {
+      colors[i] = 'neutral';
+    }
+  }
+
+  return { macdLine, signalLine, histogram, colors };
+}
+
+// Standard Average True Range (ATR) calculation
+export function calculateATR(candles: Candle[], period: number = 14): number[] {
+  const n = candles.length;
+  const atr = Array(n).fill(0);
+  if (n === 0) return atr;
+
+  const tr = Array(n).fill(0);
+  tr[0] = candles[0].high - candles[0].low;
+
+  for (let i = 1; i < n; i++) {
+    const high = candles[i].high;
+    const low = candles[i].low;
+    const prevClose = candles[i - 1].close;
+    tr[i] = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose)
+    );
+  }
+
+  let atrSum = tr.slice(0, period).reduce((sum, v) => sum + v, 0);
+  atr[period - 1] = atrSum / period;
+
+  for (let i = period; i < n; i++) {
+    atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period;
+  }
+
+  for (let i = 0; i < period - 1; i++) {
+    atr[i] = atr[period - 1];
+  }
+
+  return atr;
+}
+
 // 2d. TrendLine & iTrend & Signals Simulation
-export function calculateGGShot(
+export function calculateSrade(
   candles: Candle[],
   period: number = 80,
   dev: number = 2.0,
@@ -351,7 +485,7 @@ export function calculateGGShot(
 
   const { mid, upper, lower } = bollingerBands(closes, period, dev);
 
-  // 1a. Calulating BBSignal
+  // 1a. BBSignal calculation
   const bbSignals = Array(n).fill(0);
   for (let i = 0; i < n; i++) {
     const up = upper[i];
@@ -363,7 +497,7 @@ export function calculateGGShot(
     }
   }
 
-  // 1b & 1c. TrendLine & iTrend calculation
+  // 1b & 1c. TrendLine & iTrend calculation for backward compatibility
   const trendLine = Array(n).fill(0);
   const iTrend = Array(n).fill(0);
 
@@ -403,30 +537,53 @@ export function calculateGGShot(
     }
   }
 
-  // 1d. Entry Signals (iTrend flip)
+  // ---- NEW STRATEGY CALCULATIONS ----
+  const rsi = calculateRSI(closes, 14);
+  const { macdLine, signalLine, histogram: macdHist, colors: macdColors } = calculateMACD(closes, 12, 26, 9);
+  const atr = calculateATR(candles, 14);
+
+  // 1d. Entry Signals matching:
+  // - LONG: RSI < 30 & MACD shifts from deep red to light red
+  // - SHORT: RSI > 70 (overbought) & MACD shifts from deep green to light green
   const signals: ('LONG' | 'SHORT' | null)[] = Array(n).fill(null);
-  for (let i = 1; i < n; i++) {
-    const prev = iTrend[i - 1];
-    const curr = iTrend[i];
-    if (prev <= 0 && curr === 1) {
+  for (let i = 2; i < n; i++) {
+    const currentRsi = rsi[i];
+    
+    // Check MACD shifts
+    const prevColor = macdColors[i - 1];
+    const currColor = macdColors[i];
+
+    const isMacdBullishShift = (prevColor === 'deep_red' && currColor === 'light_red');
+    const isMacdBearishShift = (prevColor === 'deep_green' && currColor === 'light_green');
+
+    // Relaxed RSI conditions for higher frequency
+    if (currentRsi <= 45 && isMacdBullishShift) {
       signals[i] = 'LONG';
-    } else if (prev >= 0 && curr === -1) {
+    } else if (currentRsi >= 55 && isMacdBearishShift) {
       signals[i] = 'SHORT';
     }
   }
 
-  // ----- CALCULATE NEW FILTER METRICS -----
-  
-  // 1. ADX Filter
-  const { adx } = calculateADX(candles, 14);
+  // Adjust TrendLine or iTrend visualization to match the new strategy
+  // Let iTrend trace the last active signal bias for chart visual purity
+  let lastBias = 0;
+  for (let i = 0; i < n; i++) {
+    if (signals[i] === 'LONG') {
+      lastBias = 1;
+    } else if (signals[i] === 'SHORT') {
+      lastBias = -1;
+    }
+    if (lastBias !== 0) {
+      iTrend[i] = lastBias;
+    }
+  }
 
-  // 2. Volume Filter
+  // ----- CALCULATE NEW FILTER METRICS -----
+  const { adx } = calculateADX(candles, 14);
   const baseVol24h = getCoinBase24hVolume(symbol);
   
-  // Populate individual kline volume if empty
   const volumes = candles.map((c, i) => {
     if (c.volume !== undefined && c.volume > 0) return c.volume;
-    // Simulate deterministic kline volume based on index and base24h volume
     const cycle = Math.sin(i / 10) * 0.4 + 1.0;
     return (baseVol24h / 24) * cycle * (0.8 + Math.random() * 0.4);
   });
@@ -436,18 +593,15 @@ export function calculateGGShot(
   const latestVolSma = volumeSma[volumeSma.length - 1] || 1000;
   const volumeRatio = latestVol / latestVolSma;
 
-  // 3. Multi-Timeframe Confirmation Trend (4H)
   const candles4h = aggregateTo4Hour(candles);
   const bbPeriod4h = Math.max(10, Math.round(period / 4));
   const iTrend4h = calculateITrendOnly(candles4h, bbPeriod4h, dev);
   const mtf4hITrend = iTrend4h.length > 0 ? iTrend4h[iTrend4h.length - 1] : 0;
 
-  // 4. Funding Rate & Liquidity values
   const currentBias = iTrend[iTrend.length - 1] || 0;
   const fundingRate = getCoinFundingRate(symbol, currentBias);
   const volume24hUsdt = baseVol24h * (0.9 + Math.sin(Date.now() / 100000) * 0.1);
 
-  // 5. 4H EMA 200 (Equivalent to 800-period EMA on 1H chart)
   const ema200_4h = ema(closes, 800);
 
   return {
@@ -465,5 +619,11 @@ export function calculateGGShot(
     fundingRate,
     volume24hUsdt,
     ema200_4h,
+    rsi,
+    macdLine,
+    signalLine,
+    macdHist,
+    macdColors,
+    atr,
   };
 }

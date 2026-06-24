@@ -1,5 +1,5 @@
 {
-  "name": "GG-SHOT Trading Engine",
+  "name": "Srade Trading Engine",
   "description": "High-frequency Bollinger Band TrendLine analytical dashboard tracking Binance Futures with realtime TP/SL surge indicators and Daily Performance analysis.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

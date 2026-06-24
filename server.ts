@@ -34,7 +34,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`GG-SHOT Operating Server running on port ${PORT}`);
+    console.log(`Srade Operating Server running on port ${PORT}`);
   });
 }
 

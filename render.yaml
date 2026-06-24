@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: gg-shot-engine
+    name: srade-engine
     env: node
     buildCommand: npm install && npm run build
     startCommand: npm start
