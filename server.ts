@@ -13,7 +13,12 @@ dns.setDefaultResultOrder("ipv4first");
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT as string, 10) : 3000;
+
+  // Health check for Render
+  app.get('/health', (req, res) => {
+    res.status(200).send('OK');
+  });
 
   // Mount API routes from the separated module for Vercel
   app.use(apiApp);

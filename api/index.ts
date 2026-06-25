@@ -515,14 +515,20 @@ function processTradeUpdateServerLogic(
   const stats = { ...currentStats };
   let loggedMsg: string | null = null;
 
+  // Trailing Stop Loss Logic
+  let slBound = trade.sl;
+  if (realizedTps[2]) slBound = trade.tps[1];      // TP3 hit -> SL to TP2
+  else if (realizedTps[1]) slBound = trade.tps[0]; // TP2 hit -> SL to TP1
+  else if (realizedTps[0]) slBound = entry;        // TP1 hit -> SL to BE
+
   // 1. Check stop loss bound
-  const slBound = trade.sl;
   const hitSL = isLong ? currentPrice <= slBound : currentPrice >= slBound;
 
   if (hitSL) {
     const remainingPnl = (currentSize * (isLong ? (slBound - entry) : (entry - slBound))) / entry;
     const totalPnl = partialPnlRealized + remainingPnl;
     const finalPercent = (totalPnl / initialSize) * 100;
+    const isTrailingStop = finalPercent > 0;
 
     const closed = {
       ...trade,
@@ -531,7 +537,7 @@ function processTradeUpdateServerLogic(
       exitPrice: slBound,
       pnl: totalPnl,
       pnlPercent: finalPercent,
-      status: 'LOSS',
+      status: isTrailingStop ? 'WIN' : 'LOSS',
       timestamp: Date.now()
     };
 
@@ -540,14 +546,14 @@ function processTradeUpdateServerLogic(
     stats.lost += (totalPnl <= 0 ? 1 : 0);
     stats.totalPnl += remainingPnl;
 
-    loggedMsg = `[STOP LOSS HIT] ${trade.symbol} ${trade.direction} hit SL at ${formatPrice(slBound)}! Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`;
+    loggedMsg = `[${isTrailingStop ? 'TRAILING STOP' : 'STOP LOSS'} HIT] ${trade.symbol} ${trade.direction} hit SL at ${formatPrice(slBound)}! Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`;
 
     sendTelegramMessage(
-      `🚨 <b>Srade Stop Loss Hit</b>\n\n` +
+      `${isTrailingStop ? '🛡️' : '🚨'} <b>Srade ${isTrailingStop ? 'Trailing Stop' : 'Stop Loss'} Hit</b>\n\n` +
       `🆔 <b>trade id:</b> ${displayId}\n` +
       `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
-      `📉 <b>Event:</b> Position hit Stop Loss bound\n` +
-      `💵 <b>SL price:</b> ${formatPrice(slBound)}\n` +
+      `📉 <b>Event:</b> Position hit ${isTrailingStop ? 'Trailing Stop' : 'Stop Loss'} bound\n` +
+      `💵 <b>Exit price:</b> ${formatPrice(slBound)}\n` +
       `📊 <b>Net Cycle Performance:</b> <b>${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%</b>`
     ).catch(() => {});
 
@@ -673,6 +679,7 @@ function processTradeUpdateServerLogic(
   // Otherwise, keep the active position alive but updated
   const nextActive = {
     ...trade,
+    sl: slBound,
     currentPrice,
     size: currentSize,
     realizedTps,
@@ -1136,19 +1143,8 @@ async function processTelegramQueue() {
       };
 
       if (item.imageType === "LONG" || item.imageType === "SHORT") {
-        const fs = typeof require !== 'undefined' ? require('fs') : await import('fs');
-        const imagePath = path.join(process.cwd(), "src/assets/images", item.imageType === "LONG" ? "long.jpg" : "short.jpg");
-        
-        if (fs.existsSync(imagePath)) {
-          telegramUrl = `https://api.telegram.org/bot${activeToken}/sendPhoto`;
-          const form = new FormData();
-          form.append("chat_id", activeChatId);
-          form.append("caption", item.message);
-          form.append("parse_mode", "HTML");
-          const buffer = fs.readFileSync(imagePath);
-          form.append("photo", new Blob([buffer], { type: "image/jpeg" }), `${item.imageType.toLowerCase()}.jpg`);
-          fetchOptions = { method: "POST", body: form };
-        }
+        // Temporarily disabled photo sending for Render compatibility
+        // It falls back to standard text message.
       }
 
       const response = await fetch(telegramUrl, fetchOptions);
@@ -1161,13 +1157,14 @@ async function processTelegramQueue() {
           await new Promise(r => setTimeout(r, retryAfter * 1000 + 500));
           continue; // Retry this item
         } else {
-          console.error("Telegram API Error:", telegramData);
+          console.error("[TELEGRAM API ERROR]", telegramData);
           throw new Error(telegramData.description || `Telegram response status ${response.status}`);
         }
       }
       
       item.resolve(telegramData);
     } catch (e: any) {
+      console.error("[TELEGRAM GATEWAY EXCEPTION]", e.message || e);
       item.reject(e);
     }
 
@@ -1385,8 +1382,8 @@ async function runMarketScan() {
     let triggeredSignals = 0;
     
     // We only process the top 15 to avoid API limits on free tiers, or run concurrently
-    // Using MAJOR_FUTURES slice, processing all in parallel
-    const processPromises = MAJOR_FUTURES.slice(0, 15).map(async (coin) => {
+    // Using MAJOR_FUTURES, processing all in parallel
+    const processPromises = MAJOR_FUTURES.map(async (coin) => {
       try {
         const symbol = `${coin}USDT`;
         const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
@@ -1410,34 +1407,37 @@ async function runMarketScan() {
         const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
         const resList = calculateSrade(candles, config.bbPeriod, config.bbDev, coin);
         
-        const targetIdx = candles.length - 2;
-        const candleTime = candles[targetIdx].time;
-        const processedKey = `${coin}_cron_${candleTime}`;
-        if (processedClosedKlines.has(processedKey)) return;
+        for (let offset = 2; offset <= 6; offset++) {
+          const targetIdx = candles.length - offset;
+          if (targetIdx < 0) continue;
+          
+          const candleTime = candles[targetIdx].time;
+          const processedKey = `${coin}_cron_${candleTime}`;
+          if (processedClosedKlines.has(processedKey)) continue;
 
-        const signal = resList.signals[targetIdx];
-        const adxVal = resList.adx[targetIdx] ?? 0;
-        const ema200val = resList.ema200_4h[targetIdx] ?? candles[targetIdx].close;
+          const signal = resList.signals[targetIdx];
+          const adxVal = resList.adx[targetIdx] ?? 0;
+          const ema200val = resList.ema200_4h[targetIdx] ?? candles[targetIdx].close;
 
-        if (signal) {
-          const state = await getSystemState();
-          const filterAdxEnabled = state?.filterAdx !== false;
-          const filterEmaEnabled = state?.filterEma !== false;
+          if (signal) {
+            const state = await getSystemState();
+            const filterAdxEnabled = state?.filterAdx !== false;
+            const filterEmaEnabled = state?.filterEma !== false;
 
-          // ADX filter rejection
-          if (!filterAdxEnabled || adxVal > 20) {
-            const closePrice = candles[targetIdx].close;
-            // 4H EMA 200 filter check
-            if (!filterEmaEnabled || (signal === 'LONG' && closePrice > ema200val) || (signal === 'SHORT' && closePrice < ema200val)) {
-              triggeredSignals++;
-              processedClosedKlines.add(processedKey);
-              
-              if (state) {
-                const activeTrades = [...(state.activeTrades || [])];
-                const existingIndex = activeTrades.findIndex((t: any) => t.symbol === coin);
+            // ADX filter rejection
+            if (!filterAdxEnabled || adxVal > 25) {
+              const closePrice = candles[targetIdx].close;
+              // 4H EMA 200 filter check
+              if (!filterEmaEnabled || (signal === 'LONG' && closePrice > ema200val) || (signal === 'SHORT' && closePrice < ema200val)) {
+                triggeredSignals++;
+                processedClosedKlines.add(processedKey);
                 
-                if (existingIndex === -1) {
-                  const currentAtr = resList.atr[targetIdx] || (closePrice * 0.015);
+                if (state) {
+                  const activeTrades = [...(state.activeTrades || [])];
+                  const existingIndex = activeTrades.findIndex((t: any) => t.symbol === coin);
+                  
+                  if (existingIndex === -1) {
+                    const currentAtr = resList.atr[targetIdx] || (closePrice * 0.015);
                   const slDistance = 1.5 * currentAtr;
                   let tps: [number, number, number, number];
                   let sl: number;
@@ -1476,13 +1476,27 @@ async function runMarketScan() {
 
                   await saveSystemState(state);
 
-                  const msg = `⚡ <b>SYSTEM SCANNER (Autonomous Engine)</b>\n\n🎯 <b>${coin}USDT</b> | <b>${signal} TRIGGERED</b>\n\n💰 Entry Price: ${closePrice}\n📊 ADX: ${adxVal.toFixed(1)}${adxVal > 20 ? ' (STRONG TREND)' : ''}\n📈 4H EMA 200 Trend Check: PASS\n\n<i>This signal was processed securely via background task.</i>`;
+                  const msg = `🤖 <b>New Automated Trade Signal</b> (Background Scanner)\n\n` +
+                    `🆔 <b>trade id:</b> ${tradeId}\n` +
+                    `🪙 <b>symbol:</b> #${coin}USDT\n` +
+                    `📈 <b>direction:</b> ${signal}\n` +
+                    `💰 <b>entry:</b> $${formatPrice(closePrice)}\n` +
+                    `🎯 <b>tps:</b>\n` +
+                    `  TP1: $${formatPrice(tps[0])}\n` +
+                    `  TP2: $${formatPrice(tps[1])}\n` +
+                    `  TP3: $${formatPrice(tps[2])}\n` +
+                    `  TP4: $${formatPrice(tps[3])}\n` +
+                    `🛑 <b>sl:</b> $${formatPrice(sl)}\n\n` +
+                    `📊 <b>ADX:</b> ${adxVal.toFixed(1)}${adxVal > 25 ? ' (STRONG TREND)' : ''}\n` +
+                    `📈 <b>4H EMA 200:</b> PASS\n\n` +
+                    `<i>This signal was processed securely via background task.</i>`;
                   await sendTelegramMessage(msg, signal);
                 }
               }
             }
           }
         }
+        } // close for loop
       } catch(e) {}
     });
 

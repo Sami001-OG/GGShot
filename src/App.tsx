@@ -97,6 +97,7 @@ export default function App() {
   const [filterLiquidity, setFilterLiquidity] = usePersistentState('srade_filterLiquidity', true);
 
   const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
+  const [wsPackets, setWsPackets] = useState<string[]>([]);
 
   // Binance API Connection States
   const [binanceStatus, setBinanceStatus] = useState<BinanceStatus | null>(null);
@@ -324,14 +325,20 @@ export default function App() {
     const config = COIN_CONFIGS[trade.symbol] || DEFAULT_CONFIG;
     const alloc = config.alloc;
 
+    // Trailing Stop Loss Logic
+    let slBound = trade.sl;
+    if (realizedTps[2]) slBound = trade.tps[1];      // TP3 hit -> SL to TP2
+    else if (realizedTps[1]) slBound = trade.tps[0]; // TP2 hit -> SL to TP1
+    else if (realizedTps[0]) slBound = entry;        // TP1 hit -> SL to BE
+
     // 1. Check stop loss bound
-    const slBound = trade.sl;
     const hitSL = isLong ? currentPrice <= slBound : currentPrice >= slBound;
 
     if (hitSL) {
       const remainingPnl = (currentSize * (isLong ? (slBound - entry) : (entry - slBound))) / entry;
       const totalPnl = partialPnlRealized + remainingPnl;
       const finalPercent = (totalPnl / initialSize) * 100;
+      const isTrailingStop = finalPercent > 0;
 
       const closed: ClosedTrade = {
         ...trade,
@@ -340,7 +347,7 @@ export default function App() {
         exitPrice: slBound,
         pnl: totalPnl,
         pnlPercent: finalPercent,
-        status: 'LOSS',
+        status: isTrailingStop ? 'WIN' : 'LOSS',
         timestamp: Date.now()
       };
 
@@ -354,16 +361,16 @@ export default function App() {
           totalPnl: s.totalPnl + remainingPnl
         }));
 
-        writeLog(`[STOP LOSS HIT] ${trade.symbol} ${trade.direction} hit SL at ${formatPrice(slBound)}! Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`);
+        writeLog(`[${isTrailingStop ? 'TRAILING STOP' : 'STOP LOSS'} HIT] ${trade.symbol} ${trade.direction} hit SL at ${formatPrice(slBound)}! Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`);
         
-        persistTradeUpdate(trade.dbId, slBound, finalPercent, 'LOSS');
+        persistTradeUpdate(trade.dbId, slBound, finalPercent, isTrailingStop ? 'WIN' : 'LOSS');
 
         sendTelegramNotification(
-          `🚨 <b>Srade Stop Loss Hit</b>\n` +
+          `${isTrailingStop ? '🛡️' : '🚨'} <b>Srade ${isTrailingStop ? 'Trailing Stop' : 'Stop Loss'} Hit</b>\n` +
           `🆔 <b>trade id:</b> ${displayId}\n` +
           `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
-          `📉 <b>Event:</b> Position hit Stop Loss bound\n` +
-          `💵 <b>SL price:</b> ${formatPrice(slBound)}\n` +
+          `📉 <b>Event:</b> Position hit ${isTrailingStop ? 'Trailing Stop' : 'Stop Loss'} bound\n` +
+          `💵 <b>Exit price:</b> ${formatPrice(slBound)}\n` +
           `📊 <b>Net Cycle Performance:</b> <b>${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%</b>`
         ).catch(() => {});
       }
@@ -516,6 +523,7 @@ export default function App() {
     // Otherwise, keep the active position alive but updated
     const nextActive: ActiveTrade = {
       ...trade,
+      sl: slBound,
       currentPrice,
       size: currentSize,
       realizedTps,
@@ -620,6 +628,11 @@ export default function App() {
               const tick = payload.data;
               const coin = tick.s.replace("USDT", "");
               const price = parseFloat(tick.c);
+              
+              setWsPackets(prev => {
+                const log = `[WS] TICK ${tick.s} @ ${price.toFixed(4)}`;
+                return [log, ...prev].slice(0, 10);
+              });
               
               setLivePrices(prev => {
                 const next = { ...prev, [coin]: price };
@@ -851,6 +864,17 @@ export default function App() {
                              <h2 className="text-[13px] font-semibold text-slate-200 flex items-center gap-2">
                                <Sliders size={14} className="text-indigo-400"/> Technical Terminal
                              </h2>
+                             <button 
+                               onClick={() => {
+                                 setTerminalLogs(prev => [`[${new Date().toLocaleTimeString()}] Triggering backend autonomous scan...`, ...prev].slice(0, 40));
+                                 fetch('/api/cron').then(r => r.json()).then(d => {
+                                   setTerminalLogs(prev => [`[${new Date().toLocaleTimeString()}] Scan complete: ${d.message}`, ...prev].slice(0, 40));
+                                 }).catch(e => console.error(e));
+                               }}
+                               className="ml-4 text-[9px] font-mono bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 px-2 py-1 rounded hover:bg-indigo-500/30 transition-colors flex items-center gap-1.5 uppercase tracking-widest font-bold"
+                             >
+                               Force Scan
+                             </button>
                           </div>
                           <div className="flex flex-wrap items-center gap-4 text-xs font-mono bg-[#070a10] border border-slate-800/60 rounded-md px-2 py-1 shadow-inner">
                             <div className="flex items-center gap-2">
@@ -902,6 +926,21 @@ export default function App() {
                           </div>
                        ) : (
                           <div className="p-4 bg-[#070a10] relative">
+                             {/* WS Stream Debugger Overlay */}
+                             <div className="absolute top-4 left-4 z-40 bg-[#0f131c]/80 backdrop-blur-sm border border-slate-700/50 rounded pointer-events-none w-48 md:w-56 overflow-hidden shadow-lg">
+                                <div className="px-2 py-1 bg-[#0d1017] border-b border-slate-700/50 flex items-center justify-between">
+                                  <span className="text-[9px] font-mono text-slate-400 font-bold uppercase tracking-widest flex items-center gap-1.5"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse shadow-[0_0_5px_rgba(52,211,153,0.5)]"></span> WS Debugger</span>
+                                </div>
+                                <div className="p-1.5 space-y-0.5 bg-[#0a0d15]/50">
+                                  {wsPackets.length > 0 ? wsPackets.map((pkt, i) => (
+                                    <div key={i} className="text-[8px] font-mono text-emerald-400/80 leading-tight truncate px-1 rounded hover:bg-slate-800/50">
+                                      {pkt}
+                                    </div>
+                                  )) : (
+                                    <div className="text-[8px] font-mono text-slate-500 leading-tight italic px-1">Waiting for ticks...</div>
+                                  )}
+                                </div>
+                             </div>
                              <div className="h-64 sm:h-[300px] flex items-end gap-[1px] md:gap-[2px] w-full relative group">
                                 {candleData.slice(-60).map((candle, idx) => {
                                    const absoluteIdx = candleData.length - Math.min(60, candleData.length) + idx;
