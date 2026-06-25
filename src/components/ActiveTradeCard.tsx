@@ -45,7 +45,7 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
     return Math.max(0, Math.min(100, pct));
   };
 
-  const points = [
+  const rawPoints = [
     { 
       label: 'SL', 
       price: sl, 
@@ -77,6 +77,28 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
       };
     }) : [])
   ];
+
+  const points = [];
+  const atZero = rawPoints.filter(p => p.percent === 0);
+  const others = rawPoints.filter(p => p.percent > 0);
+
+  if (atZero.length > 0) {
+    const slPoint = atZero.find(p => p.label === 'SL');
+    if (slPoint) {
+      const otherLabels = atZero.filter(p => p.label !== 'SL').map(p => p.label);
+      let newLabel = 'SL';
+      if (otherLabels.includes('TP3')) newLabel = 'SL (TP3)';
+      else if (otherLabels.includes('TP2')) newLabel = 'SL (TP2)';
+      else if (otherLabels.includes('TP1')) newLabel = 'SL (TP1)';
+      else if (otherLabels.includes('ENT')) newLabel = 'SL (BE)';
+      
+      points.push({ ...slPoint, label: newLabel });
+    } else {
+      points.push(atZero[atZero.length - 1]);
+    }
+  }
+  
+  points.push(...others);
 
   return (
     <motion.div 
