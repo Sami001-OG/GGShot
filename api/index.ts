@@ -1042,6 +1042,8 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
 let bybitWs: WebSocket | null = null;
 let reconnectDelay = 2000;
 
+let pingInterval: NodeJS.Timeout | null = null;
+
 function startWebSocketScreener() {
   const wsUrl = `wss://stream.bybit.com/v5/public/linear`;
 
@@ -1057,6 +1059,13 @@ function startWebSocketScreener() {
     // Subscribe to klines
     const args = MAJOR_FUTURES.map(coin => `kline.60.${coin}USDT`);
     ws.send(JSON.stringify({ op: "subscribe", args }));
+    
+    if (pingInterval) clearInterval(pingInterval);
+    pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ req_id: "ping_1", op: "ping" }));
+      }
+    }, 20000);
   });
 
   ws.on("message", (raw) => {
@@ -1092,6 +1101,7 @@ function startWebSocketScreener() {
   });
 
   ws.on("close", (code, reason) => {
+    if (pingInterval) clearInterval(pingInterval);
     console.warn(`[WEBSOCKET SCREENER] Socket disconnected (Code: ${code}). Re-establishing connection in ${reconnectDelay}ms...`);
     bybitWs = null;
     setTimeout(() => {

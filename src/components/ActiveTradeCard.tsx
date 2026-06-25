@@ -38,11 +38,11 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
     return isValidMove && (isLong ? currentPrice >= val : currentPrice <= val);
   };
 
-  const getPercentageOf = (price: number) => {
+  const getPercentageOf = (price: number, clamped = false) => {
     const range = tpBound - slBound;
     if (range === 0) return 0;
     const pct = ((price - slBound) / range) * 100;
-    return Math.max(0, Math.min(100, pct));
+    return clamped ? Math.max(0, Math.min(100, pct)) : pct;
   };
 
   const rawPoints = [
@@ -76,16 +76,16 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
           : 'bg-slate-700/85 border border-slate-900/40'
       };
     }) : [])
-  ];
+  ].filter(p => p.percent >= 0 && p.percent <= 100);
 
   const points = [];
   const atZero = rawPoints.filter(p => p.percent === 0);
   const others = rawPoints.filter(p => p.percent > 0);
 
   if (atZero.length > 0) {
-    const slPoint = atZero.find(p => p.label === 'SL');
+    const slPoint = atZero.find(p => p.label.startsWith('SL'));
     if (slPoint) {
-      const otherLabels = atZero.filter(p => p.label !== 'SL').map(p => p.label);
+      const otherLabels = atZero.filter(p => !p.label.startsWith('SL')).map(p => p.label);
       let newLabel = 'SL';
       if (otherLabels.includes('TP3')) newLabel = 'SL (TP3)';
       else if (otherLabels.includes('TP2')) newLabel = 'SL (TP2)';
