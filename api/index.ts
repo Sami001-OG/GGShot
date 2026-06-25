@@ -135,13 +135,13 @@ const MAJOR_FUTURES = [
 ];
 
 // Sub-millisecond Live Price cache updated via WebSocket
-const globalLivePrices: Record<string, number> = {};
+let globalLivePrices: Record<string, number> = {};
 
 // Keep a set of processed keys to strictly prevent double executions (idempotency)
 const processedClosedKlines = new Set<string>();
 
 // In-memory low-latency candle cache and hourly signal tracking
-const serverCoinsCandles: Record<string, any[]> = {};
+let serverCoinsCandles: Record<string, any[]> = {};
 const lastTradeCandleTime = new Map<string, number>();
 
 async function getOrFetchCandles(coin: string): Promise<any[] | null> {
@@ -151,12 +151,15 @@ async function getOrFetchCandles(coin: string): Promise<any[] | null> {
   
   try {
     const symbol = `${coin}USDT`;
-    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
+    const r = await fetch(`https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=1000`, {
       signal: AbortSignal.timeout(6000)
     });
     if (!r.ok) return null;
-    const rawCandles = await r.json() as any[];
-    const candles = rawCandles.map(c => ({
+    const data = await r.json();
+    if (data.retCode !== 0 || !data.result || !data.result.list) return null;
+    
+    const rawCandles = data.result.list.reverse();
+    const candles = rawCandles.map((c: any) => ({
       time: parseInt(c[0]),
       open: parseFloat(c[1]),
       high: parseFloat(c[2]),
@@ -443,17 +446,10 @@ async function updateCoinCandleCacheAndCheck(coin: string, k: any) {
   console.log(`[LOW-LATENCY RUNTIME] Successfully executed and stored trade: ${tradeId}`);
 
   sendTelegramMessage(
-    `🤖 <b>New Automated Trade Signal</b>\n\n` +
-    `🆔 <b>trade id:</b> ${tradeId}\n` +
-    `🪙 <b>symbol:</b> #${coin}USDT\n` +
-    `📈 <b>direction:</b> ${signal}\n` +
-    `🎯 <b>tps:</b>\n` +
-    `  TP1: $${formatPrice(tps[0])}\n` +
-    `  TP2: $${formatPrice(tps[1])}\n` +
-    `  TP3: $${formatPrice(tps[2])}\n` +
-    `  TP4: $${formatPrice(tps[3])}\n` +
-    `🛑 <b>sl:</b> $${formatPrice(sl)}\n\n` +
-    `⚡ <i>Processed in real-time low-latency local indicator analysis.</i>`,
+    `Symbol: ${coin}\n` +
+    `Direction: ${signal}\n` +
+    `TP Levels: ${formatPrice(tps[0])}, ${formatPrice(tps[1])}, ${formatPrice(tps[2])}, ${formatPrice(tps[3])}\n` +
+    `SL Level: ${formatPrice(sl)}`,
     signal
   ).catch(() => {});
 }
@@ -549,12 +545,7 @@ function processTradeUpdateServerLogic(
     loggedMsg = `[${isTrailingStop ? 'TRAILING STOP' : 'STOP LOSS'} HIT] ${trade.symbol} ${trade.direction} hit SL at ${formatPrice(slBound)}! Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`;
 
     sendTelegramMessage(
-      `${isTrailingStop ? '🛡️' : '🚨'} <b>Srade ${isTrailingStop ? 'Trailing Stop' : 'Stop Loss'} Hit</b>\n\n` +
-      `🆔 <b>trade id:</b> ${displayId}\n` +
-      `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
-      `📉 <b>Event:</b> Position hit ${isTrailingStop ? 'Trailing Stop' : 'Stop Loss'} bound\n` +
-      `💵 <b>Exit price:</b> ${formatPrice(slBound)}\n` +
-      `📊 <b>Net Cycle Performance:</b> <b>${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%</b>`
+      `${trade.symbol} hit SL`
     ).catch(() => {});
 
     return { nextActive: null, closedTrade: closed, updatedStats: stats, loggedMsg };
@@ -586,12 +577,7 @@ function processTradeUpdateServerLogic(
     loggedMsg = `[REVERSAL EXIT] ${trade.symbol} ${trade.direction} trend flipped! Exited remaining at ${formatPrice(currentPrice)}. Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`;
 
     sendTelegramMessage(
-      `🔄 <b>Srade Trend Reversal Exit</b>\n\n` +
-      `🆔 <b>trade id:</b> ${displayId}\n` +
-      `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
-      `⚠️ <b>Event:</b> Trend inverted. Safety scale-out executed.\n` +
-      `💵 <b>Reversal Price:</b> ${formatPrice(currentPrice)}\n` +
-      `📊 <b>Net Cycle Performance:</b> <b>${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%</b>`
+      `${trade.symbol} hit SL`
     ).catch(() => {});
 
     return { nextActive: null, closedTrade: closed, updatedStats: stats, loggedMsg };
@@ -620,15 +606,15 @@ function processTradeUpdateServerLogic(
       actualDeltaPnl += partPnl;
       loggedMsg = `[PARTIAL TP${i+1} HIT] ${trade.symbol} scaled out ${alloc[i]}% of units at ${formatPrice(targetPrice)}!`;
       
+      let nextSlText = '';
+      if (i === 0) nextSlText = 'breakeven';
+      else if (i === 1) nextSlText = 'TP1';
+      else if (i === 2) nextSlText = 'TP2';
+      else if (i === 3) nextSlText = 'TP3';
+
       sendTelegramMessage(
-        `🎯 <b>Srade Take Profit Achieved!</b>\n\n` +
-        `🆔 <b>trade id:</b> ${displayId}\n` +
-        `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
-        `📈 <b>Milestone:</b> Take Profit #${i+1} reached successfully! 🎉\n` +
-        `📊 <b>Scale-out Weight:</b> ${alloc[i]}%\n` +
-        `💵 <b>Price Targeted:</b> ${formatPrice(targetPrice)}\n` +
-        `📊 <b>Target Status:</b> Achieved\n` +
-        `💰 <b>Partial PnL Realized:</b> <b>+${(partPnl / initialSize * 100).toFixed(2)}%</b>`
+        `${trade.symbol} hit TP${i+1}\n` +
+        `SL to ${nextSlText}`
       ).catch(() => {});
       
       partialPnlRealized += partPnl;
@@ -665,12 +651,8 @@ function processTradeUpdateServerLogic(
     loggedMsg = `[TP4 COMPLETED] ${trade.symbol} target cycle achieved! Net PnL: +${finalPercent.toFixed(2)}%`;
 
     sendTelegramMessage(
-      `🏆 <b>Srade Cycle Fully Achieved!</b>\n\n` +
-      `🆔 <b>trade id:</b> ${displayId}\n` +
-      `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
-      `🏁 <b>Event:</b> Ultimate Take Profit #4 hit - full position realized!\n` +
-      `💵 <b>Completion Price:</b> ${formatPrice(trade.tps[3])}\n` +
-      `📊 <b>Total Net Cycle Performance:</b> <b>+${finalPercent.toFixed(2)}%</b>`
+      `${trade.symbol} hit TP4\n` +
+      `SL to TP3`
     ).catch(() => {});
 
     return { nextActive: null, closedTrade: closed, updatedStats: stats, loggedMsg };
@@ -775,12 +757,15 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
   
   try {
     const symbol = `${coin}USDT`;
-    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
+    const r = await fetch(`https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=1000`, {
       signal: AbortSignal.timeout(6000)
     });
     if (!r.ok) return;
 
-    const rawCandles = await r.json() as any[];
+    const data = await r.json();
+    if (data.retCode !== 0 || !data.result || !data.result.list) return;
+    const rawCandles = data.result.list.reverse();
+
     const candles = rawCandles.map(c => ({
       time: parseInt(c[0]),
       open: parseFloat(c[1]),
@@ -1041,17 +1026,10 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
 
     // Notify Telegram with rich, professional layout
     sendTelegramMessage(
-      `🤖 <b>New Automated Trade Signal</b>\n\n` +
-      `🆔 <b>trade id:</b> ${tradeId}\n` +
-      `🪙 <b>symbol:</b> #${coin}USDT\n` +
-      `📈 <b>direction:</b> ${signal}\n` +
-      `🎯 <b>tps:</b>\n` +
-      `  TP1: $${formatPrice(tps[0])}\n` +
-      `  TP2: $${formatPrice(tps[1])}\n` +
-      `  TP3: $${formatPrice(tps[2])}\n` +
-      `  TP4: $${formatPrice(tps[3])}\n` +
-      `🛑 <b>sl:</b> $${formatPrice(sl)}\n\n` +
-      `⚡ <i>Processed in sub-millisecond network latency from closed kline.</i>`,
+      `Symbol: ${coin}\n` +
+      `Direction: ${signal}\n` +
+      `TP Levels: ${formatPrice(tps[0])}, ${formatPrice(tps[1])}, ${formatPrice(tps[2])}, ${formatPrice(tps[3])}\n` +
+      `SL Level: ${formatPrice(sl)}`,
       signal
     ).catch(() => {});
 
@@ -1061,36 +1039,45 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
 }
 
 // self-healing WebSocket Manager
-let binanceWs: WebSocket | null = null;
+let bybitWs: WebSocket | null = null;
 let reconnectDelay = 2000;
 
 function startWebSocketScreener() {
-  const wsStreams = MAJOR_FUTURES.map(coin => `${coin.toLowerCase()}usdt@kline_1h`).join("/");
-  const wsUrl = `wss://fstream.binance.com/stream?streams=${wsStreams}`;
+  const wsUrl = `wss://stream.bybit.com/v5/public/linear`;
 
-  console.log("[WEBSOCKET SCREENER] Connecting to live Binance Futures WebSockets...");
+  console.log("[WEBSOCKET SCREENER] Connecting to live Bybit Futures WebSockets...");
   
   const ws = new WebSocket(wsUrl);
-  binanceWs = ws;
+  bybitWs = ws;
 
   ws.on("open", () => {
     console.log("[WEBSOCKET SCREENER] Connection established on 1H kline streams! Low latency monitoring active.");
     reconnectDelay = 2000;
+    
+    // Subscribe to klines
+    const args = MAJOR_FUTURES.map(coin => `kline.60.${coin}USDT`);
+    ws.send(JSON.stringify({ op: "subscribe", args }));
   });
 
   ws.on("message", (raw) => {
     try {
       const payload = JSON.parse(raw.toString());
-      if (payload && payload.data) {
-        const data = payload.data;
-        if (data.e === "kline") {
-          const coin = data.s.replace("USDT", "");
-          const k = data.k;
+      if (payload.topic && payload.topic.startsWith("kline.60.")) {
+        const coin = payload.topic.replace("kline.60.", "").replace("USDT", "");
+        if (payload.data && payload.data.length > 0) {
+          const k = payload.data[0];
+          globalLivePrices[coin] = parseFloat(k.close);
           
-          globalLivePrices[coin] = parseFloat(k.c);
+          const binanceLikeK = {
+            t: k.start,
+            c: k.close,
+            h: k.high,
+            l: k.low,
+            v: k.volume,
+            x: k.confirm
+          };
           
-          // Low-latency local candle caching, indicator calculations, and real-time confluence signal monitoring
-          updateCoinCandleCacheAndCheck(coin, k).catch(err => {
+          updateCoinCandleCacheAndCheck(coin, binanceLikeK).catch(err => {
             console.error(`[LOW-LATENCY RUNTIME] Error in cache check for ${coin}:`, err.message);
           });
         }
@@ -1106,7 +1093,7 @@ function startWebSocketScreener() {
 
   ws.on("close", (code, reason) => {
     console.warn(`[WEBSOCKET SCREENER] Socket disconnected (Code: ${code}). Re-establishing connection in ${reconnectDelay}ms...`);
-    binanceWs = null;
+    bybitWs = null;
     setTimeout(() => {
       reconnectDelay = Math.min(reconnectDelay * 2, 60000);
       startWebSocketScreener();
@@ -1243,56 +1230,7 @@ app.post("/api/trades/record", async (req, res) => {
   }
 });
 
-// Endpoint to manually trigger the daily 24h cron
-app.post("/api/trades/daily-report", async (req, res) => {
-  try {
-    const success = await processDailyReport();
-    res.json({ success });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-async function processDailyReport() {
-  if (mongoose.connection.readyState !== 1) return false;
-  try {
-    const trades = await TradeModel.find({});
-    if (trades.length === 0) {
-      await sendTelegramMessage("📊 <b>Daily Report:</b>\nNo trades were recorded in the last 24h.");
-      return true;
-    }
-
-    const won = trades.filter(t => t.pnlPercent > 0).length;
-    const lost = trades.filter(t => t.pnlPercent < 0).length;
-    const breakevenOrOpen = trades.length - won - lost;
-    
-    let totalPnl = 0;
-    trades.forEach(t => totalPnl += (t.pnlPercent || 0));
-
-    const msg = `📊 <b>Daily 24h Trade Report</b> 📊\n\n` +
-      `Total Signals/Trades: ${trades.length}\n` +
-      `✅ Win: ${won}\n` +
-      `❌ Loss: ${lost}\n` +
-      `⚪ Open/Breakeven: ${breakevenOrOpen}\n` +
-      `💰 Total Net PnL: ${totalPnl > 0 ? '+' : ''}${totalPnl.toFixed(2)}%\n\n` +
-      `<i>Database has been wiped for the next 24h cycle.</i>`;
-      
-    await sendTelegramMessage(msg);
-
-    // After 24h, a report from db will go through telegram and the db will be blank
-    await TradeModel.deleteMany({});
-    
-    return true;
-  } catch (error) {
-    console.error("Daily report failed", error);
-    return false;
-  }
-}
-
-// 24H cron interval
-setInterval(() => {
-  processDailyReport();
-}, 24 * 60 * 60 * 1000);
+// Daily report removed as per user instruction.
 
 app.get("/api/db/state", async (req, res) => {
   if (!db) return res.json({ error: "Database not connected" });
@@ -1386,12 +1324,14 @@ async function runMarketScan() {
     const processPromises = MAJOR_FUTURES.map(async (coin) => {
       try {
         const symbol = `${coin}USDT`;
-        const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
+        const r = await fetch(`https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=1000`, {
           signal: AbortSignal.timeout(8000)
         });
         if (!r.ok) return;
 
-        const rawCandles = await r.json() as any[];
+        const data = await r.json();
+        if (data.retCode !== 0 || !data.result || !data.result.list) return;
+        const rawCandles = data.result.list.reverse();
         const candles = rawCandles.map(c => ({
           time: parseInt(c[0]),
           open: parseFloat(c[1]),
@@ -1476,20 +1416,10 @@ async function runMarketScan() {
 
                   await saveSystemState(state);
 
-                  const msg = `🤖 <b>New Automated Trade Signal</b> (Background Scanner)\n\n` +
-                    `🆔 <b>trade id:</b> ${tradeId}\n` +
-                    `🪙 <b>symbol:</b> #${coin}USDT\n` +
-                    `📈 <b>direction:</b> ${signal}\n` +
-                    `💰 <b>entry:</b> $${formatPrice(closePrice)}\n` +
-                    `🎯 <b>tps:</b>\n` +
-                    `  TP1: $${formatPrice(tps[0])}\n` +
-                    `  TP2: $${formatPrice(tps[1])}\n` +
-                    `  TP3: $${formatPrice(tps[2])}\n` +
-                    `  TP4: $${formatPrice(tps[3])}\n` +
-                    `🛑 <b>sl:</b> $${formatPrice(sl)}\n\n` +
-                    `📊 <b>ADX:</b> ${adxVal.toFixed(1)}${adxVal > 25 ? ' (STRONG TREND)' : ''}\n` +
-                    `📈 <b>4H EMA 200:</b> PASS\n\n` +
-                    `<i>This signal was processed securely via background task.</i>`;
+                  const msg = `Symbol: ${coin}\n` +
+                    `Direction: ${signal}\n` +
+                    `TP Levels: ${formatPrice(tps[0])}, ${formatPrice(tps[1])}, ${formatPrice(tps[2])}, ${formatPrice(tps[3])}\n` +
+                    `SL Level: ${formatPrice(sl)}`;
                   await sendTelegramMessage(msg, signal);
                 }
               }
@@ -1540,9 +1470,47 @@ app.get("/api/binance/status", (req, res) => {
       ? `${process.env.BINANCE_API_KEY?.substring(0, 6)}...${process.env.BINANCE_API_KEY?.slice(-4)}` 
       : "Not Set",
     secretMask: secretPreset ? "********" : "Not Set",
-    binanceUrl: "https://fapi.binance.com",
+    binanceUrl: "https://api.bybit.com",
     serverTime: new Date().toISOString()
   });
+});
+
+app.post("/api/db/reset", async (req, res) => {
+  try {
+    if (db && db !== memoryDb) {
+      await db.collection("system_state").deleteMany({});
+      await TradeModel.deleteMany({});
+      await DailyCounterModel.deleteMany({});
+    }
+    
+    // Also reset global server memory state
+    globalLivePrices = {};
+    serverCoinsCandles = {};
+    telegramQueue.length = 0;
+    
+    // Re-init default state in db
+    const initialState = { 
+      id: "main",
+      stats: { balance: 0, won: 0, lost: 0, totalPnl: 0 },
+      activeTrades: [],
+      closedTrades: [],
+      logs: [],
+      updatedAt: Date.now()
+    };
+    if (db && db !== memoryDb) {
+      await db.collection("system_state").updateOne(
+        { id: "main" },
+        { $set: initialState },
+        { upsert: true }
+      );
+    } else {
+      memoryDbStore["main"] = initialState;
+    }
+    
+    res.json({ success: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // 2. API: Fetch Live Binance Futures perpetual prices
@@ -1557,23 +1525,28 @@ app.get("/api/binance/prices", async (req, res) => {
       });
     }
 
-    const baseUrl = "https://fapi.binance.com";
-    const response = await fetch(`${baseUrl}/fapi/v1/ticker/price`, {
+    const baseUrl = "https://api.bybit.com";
+    const response = await fetch(`${baseUrl}/v5/market/tickers?category=linear`, {
       signal: AbortSignal.timeout(4000)
     });
     
     if (!response.ok) {
-      throw new Error(`Binance API error: ${response.statusText}`);
+      throw new Error(`Bybit API error: ${response.statusText}`);
     }
 
-    const rawPrices = await response.json() as Array<{ symbol: string; price: string }>;
+    const data = await response.json();
+    if (data.retCode !== 0 || !data.result || !data.result.list) {
+       throw new Error(`Bybit API data format error`);
+    }
+
+    const rawPrices = data.result.list as Array<{ symbol: string; lastPrice: string }>;
     
     // Filter for some USDT pairs
     const usdtPrices: Record<string, number> = {};
     rawPrices.forEach(item => {
       if (item.symbol.endsWith("USDT")) {
         const coin = item.symbol.replace("USDT", "");
-        const val = parseFloat(item.price);
+        const val = parseFloat(item.lastPrice);
         usdtPrices[coin] = val;
         globalLivePrices[coin] = val; // populate cache too
       }
@@ -1581,7 +1554,7 @@ app.get("/api/binance/prices", async (req, res) => {
 
     res.json({
       success: true,
-      source: "Binance Futures API (Fallback)",
+      source: "Bybit Futures API (Fallback)",
       prices: usdtPrices
     });
   } catch (error: any) {
@@ -1594,7 +1567,7 @@ app.get("/api/binance/prices", async (req, res) => {
     }
     res.json({
       success: false,
-      message: error.message || "Failed to contact Binance Futures API"
+      message: error.message || "Failed to contact Bybit Futures API"
     });
   }
 });
@@ -1604,9 +1577,9 @@ app.get("/api/binance/metrics/:coin", async (req, res) => {
   try {
     const coin = (req.params.coin || "BTC").toUpperCase();
     const symbol = `${coin}USDT`;
-    const baseUrl = "https://fapi.binance.com";
+    const baseUrl = "https://api.bybit.com";
 
-    const r = await fetch(`${baseUrl}/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
+    const r = await fetch(`${baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=1000`, {
       signal: AbortSignal.timeout(6000)
     });
 
@@ -1614,7 +1587,11 @@ app.get("/api/binance/metrics/:coin", async (req, res) => {
       throw new Error(`Failed to fetch candles: ${r.statusText}`);
     }
 
-    const rawCandles = await r.json() as any[];
+    const data = await r.json();
+    if (data.retCode !== 0 || !data.result || !data.result.list) {
+        throw new Error(`Failed to parse candles`);
+    }
+    const rawCandles = data.result.list.reverse();
     // Parse as open, high, low, close, volume, closeTime, quoteVolume
     const candles = rawCandles.map(c => ({
       time: parseInt(c[0]),

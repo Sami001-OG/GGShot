@@ -366,12 +366,7 @@ export default function App() {
         persistTradeUpdate(trade.dbId, slBound, finalPercent, isTrailingStop ? 'WIN' : 'LOSS');
 
         sendTelegramNotification(
-          `${isTrailingStop ? '🛡️' : '🚨'} <b>Srade ${isTrailingStop ? 'Trailing Stop' : 'Stop Loss'} Hit</b>\n` +
-          `🆔 <b>trade id:</b> ${displayId}\n` +
-          `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
-          `📉 <b>Event:</b> Position hit ${isTrailingStop ? 'Trailing Stop' : 'Stop Loss'} bound\n` +
-          `💵 <b>Exit price:</b> ${formatPrice(slBound)}\n` +
-          `📊 <b>Net Cycle Performance:</b> <b>${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%</b>`
+          `${trade.symbol} hit SL`
         ).catch(() => {});
       }
 
@@ -411,12 +406,7 @@ export default function App() {
         persistTradeUpdate(trade.dbId, currentPrice, finalPercent, status);
 
         sendTelegramNotification(
-          `🔄 <b>Srade Trend Reversal Exit</b>\n` +
-          `🆔 <b>trade id:</b> ${displayId}\n` +
-          `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
-          `⚠️ <b>Event:</b> Trend inverted. Safety scale-out executed.\n` +
-          `💵 <b>Reversal Price:</b> ${formatPrice(currentPrice)}\n` +
-          `📊 <b>Net Cycle Performance:</b> <b>${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%</b>`
+          `${trade.symbol} hit SL`
         ).catch(() => {});
       }
 
@@ -451,15 +441,15 @@ export default function App() {
           actualDeltaPnl += partPnl;
           writeLog(`[PARTIAL TP${i+1} HIT] ${trade.symbol} scaled out ${alloc[i]}% of units at ${formatPrice(targetPrice)}!`);
           
+          let nextSlText = '';
+          if (i === 0) nextSlText = 'breakeven';
+          else if (i === 1) nextSlText = 'TP1';
+          else if (i === 2) nextSlText = 'TP2';
+          else if (i === 3) nextSlText = 'TP3';
+
           sendTelegramNotification(
-            `🎯 <b>Srade Take Profit Achieved!</b>\n` +
-            `🆔 <b>trade id:</b> ${displayId}\n` +
-            `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
-            `📈 <b>Milestone:</b> Take Profit #${i+1} reached successfully! 🎉\n` +
-            `📊 <b>Scale-out Weight:</b> ${alloc[i]}%\n` +
-            `💵 <b>Price Targeted:</b> ${formatPrice(targetPrice)}\n` +
-            `📊 <b>Target Status:</b> Achieved\n` +
-            `💰 <b>Partial PnL Realized:</b> <b>+${(partPnl / initialSize * 100).toFixed(2)}%</b>`
+            `${trade.symbol} hit TP${i+1}\n` +
+            `SL to ${nextSlText}`
           ).catch(() => {});
         }
         
@@ -508,12 +498,8 @@ export default function App() {
         persistTradeUpdate(trade.dbId, trade.tps[3], finalPercent, 'WIN');
 
         sendTelegramNotification(
-          `🏆 <b>Srade Cycle Fully Achieved!</b>\n` +
-          `🆔 <b>trade id:</b> ${displayId}\n` +
-          `🪙 <b>Asset:</b> #${trade.symbol}USDT [${trade.direction}]\n` +
-          `🏁 <b>Event:</b> Ultimate Take Profit #4 hit - full position realized!\n` +
-          `💵 <b>Completion Price:</b> ${formatPrice(trade.tps[3])}\n` +
-          `📊 <b>Total Net Cycle Performance:</b> <b>+${finalPercent.toFixed(2)}%</b>`
+          `${trade.symbol} hit TP4\n` +
+          `SL to TP3`
         ).catch(() => {});
       }
 
@@ -618,41 +604,48 @@ export default function App() {
     const connectLiveWS = () => {
       if (!active) return;
       try {
-        const streams = MAJOR_FUTURES.map(coin => `${coin.toLowerCase()}usdt@ticker`).join("/");
-        ws = new WebSocket(`wss://fstream.binance.com/stream?streams=${streams}`);
+        ws = new WebSocket(`wss://stream.bybit.com/v5/public/linear`);
         
+        ws.onopen = () => {
+           const args = MAJOR_FUTURES.map(coin => `tickers.${coin}USDT`);
+           ws?.send(JSON.stringify({ op: "subscribe", args }));
+        };
+
         ws.onmessage = (event) => {
           try {
             const payload = JSON.parse(event.data);
-            if (payload && payload.data) {
-              const tick = payload.data;
-              const coin = tick.s.replace("USDT", "");
-              const price = parseFloat(tick.c);
+            if (payload.topic && payload.topic.startsWith("tickers.")) {
+              const symbol = payload.data.symbol || payload.topic.replace("tickers.", "");
+              const coin = symbol.replace("USDT", "");
               
-              setWsPackets(prev => {
-                const log = `[WS] TICK ${tick.s} @ ${price.toFixed(4)}`;
-                return [log, ...prev].slice(0, 10);
-              });
-              
-              setLivePrices(prev => {
-                const next = { ...prev, [coin]: price };
-                checkRealPriceExits(next);
-                return next;
-              });
+              if (payload.data.lastPrice) {
+                 const price = parseFloat(payload.data.lastPrice);
+                 
+                 setWsPackets(prev => {
+                   const log = `[WS] TICK ${symbol} @ ${price.toFixed(4)}`;
+                   return [log, ...prev].slice(0, 10);
+                 });
+                 
+                 setLivePrices(prev => {
+                   const next = { ...prev, [coin]: price };
+                   checkRealPriceExits(next);
+                   return next;
+                 });
 
-              // Slide real-time prices into focus candle
-              setCoinsCandles(prev => {
-                if (prev[coin]) {
-                  const list = [...prev[coin]];
-                  if (list.length > 0) {
-                    const last = { ...list[list.length - 1] };
-                    last.close = price;
-                    list[list.length - 1] = last;
-                    return { ...prev, [coin]: list };
-                  }
-                }
-                return prev;
-              });
+                 // Slide real-time prices into focus candle
+                 setCoinsCandles(prev => {
+                   if (prev[coin]) {
+                     const list = [...prev[coin]];
+                     if (list.length > 0) {
+                       const last = { ...list[list.length - 1] };
+                       last.close = price;
+                       list[list.length - 1] = last;
+                       return { ...prev, [coin]: list };
+                     }
+                   }
+                   return prev;
+                 });
+              }
             }
           } catch (_) {}
         };
@@ -817,23 +810,25 @@ export default function App() {
              <div className="flex items-center gap-3 font-mono">
                  <button 
                     onClick={async () => {
-                      writeLog("[24H REPORT] Requesting Mongoose to compile 24h trade report via Telegram...");
+                      if (!confirm("Are you sure you want to reset the entire database? This will clear all trades, stats, and logs.")) return;
+                      writeLog("[SYSTEM] Initiating full database reset...");
                       try {
-                        const res = await fetch("/api/trades/daily-report", { method: "POST" });
+                        const res = await fetch("/api/db/reset", { method: "POST" });
                         const data = await res.json();
                         if (data.success) {
-                          writeLog(`[24H REPORT SUCCESS] Daily Telegram report triggered, DB wiped.`);
+                          writeLog(`[SYSTEM SUCCESS] Database reset complete.`);
+                          setTimeout(() => window.location.reload(), 1000);
                         } else {
-                          writeLog(`[24H REPORT ERROR] Failed to process daily report`);
+                          writeLog(`[SYSTEM ERROR] Failed to reset database`);
                         }
                       } catch (err: any) {
-                        writeLog(`[24H REPORT EXCEPTION] ${err.message}`);
+                        writeLog(`[SYSTEM EXCEPTION] ${err.message}`);
                       }
                     }}
-                    className={cn("flex items-center gap-2 px-3 py-1.5 rounded-[4px] font-bold text-[9px] uppercase tracking-widest transition-all border", "bg-indigo-500/5 text-indigo-400 border-indigo-500/20 hover:bg-indigo-500/10")}
+                    className={cn("flex items-center gap-2 px-3 py-1.5 rounded-[4px] font-bold text-[9px] uppercase tracking-widest transition-all border", "bg-rose-500/5 text-rose-400 border-rose-500/20 hover:bg-rose-500/10")}
                  >
                     <Database size={10} strokeWidth={3}/>
-                    Trigger Daily Report
+                    Reset System
                  </button>
              </div>
          </header>
