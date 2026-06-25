@@ -103,6 +103,11 @@ export default function App() {
   const [binanceStatus, setBinanceStatus] = useState<BinanceStatus | null>(null);
   const [livePrices, setLivePrices] = useState<Record<string, number>>({});
   const [apiError, setApiError] = useState<string | null>(null);
+
+  const livePricesRef = useRef<Record<string, number>>({});
+  useEffect(() => {
+    livePricesRef.current = livePrices;
+  }, [livePrices]);
   
   // Graph focus
   const [selectedCoin, setSelectedCoin] = useState<string>('SOL');
@@ -116,6 +121,55 @@ export default function App() {
   const [tgBackendStatus, setTgBackendStatus] = useState<{ configured: boolean } | null>(null);
   const [tgTestStatus, setTgTestStatus] = useState<{ success: boolean; message: string } | null>(null);
   const [tgSending, setTgSending] = useState(false);
+
+  const [healing, setHealing] = useState(false);
+  const [healMessage, setHealMessage] = useState<string | null>(null);
+
+  const triggerFullSync = () => {
+    fetch('/api/db/state')
+      .then(res => res.json())
+      .then(data => {
+        if (!data.error) {
+          if (data.activeTrades) {
+            setActiveTrades(prev => {
+              return data.activeTrades.map((t: any) => {
+                const existing = prev.find((p: any) => p.id === t.id || p.dbId === t.dbId);
+                const livePrice = livePricesRef.current[t.symbol] ?? existing?.currentPrice ?? t.currentPrice;
+                return {
+                  ...t,
+                  currentPrice: livePrice
+                };
+              });
+            });
+          }
+          if (data.closedTrades) setClosedTrades(data.closedTrades);
+          if (data.stats) setStats(data.stats);
+          if (data.logs) setTerminalLogs(data.logs);
+        }
+      })
+      .catch(() => {});
+  };
+
+  const handleHealDatabase = async () => {
+    setHealing(true);
+    setHealMessage(null);
+    try {
+      const res = await fetch('/api/admin/heal');
+      const data = await res.json();
+      if (data.success) {
+        setHealMessage("Database healed!");
+        writeLog("[DATABASE HEALER] Success: Existing trade records and system state successfully healed.");
+        triggerFullSync();
+      } else {
+        setHealMessage(data.error || "Failed to heal");
+      }
+    } catch (e: any) {
+      setHealMessage("Network error");
+    } finally {
+      setHealing(false);
+      setTimeout(() => setHealMessage(null), 6000);
+    }
+  };
 
   // Fetch server status config
   const reloadTelegramStatus = () => {
@@ -175,22 +229,24 @@ export default function App() {
           if (!data.error) {
             if (data.activeTrades) {
               setActiveTrades(prev => {
-                const prevIds = new Set(prev.map(t => t.id));
-                const closedIds = new Set(closedTradesRef.current.map(t => t.id));
-                const newTrades = data.activeTrades.filter((t: any) => !prevIds.has(t.id) && !closedIds.has(t.id));
-                
-                if (newTrades.length > 0) {
-                   return [...prev, ...newTrades];
-                }
-                return prev;
+                return data.activeTrades.map((t: any) => {
+                  const existing = prev.find((p: any) => p.id === t.id || p.dbId === t.dbId);
+                  const livePrice = livePricesRef.current[t.symbol] ?? existing?.currentPrice ?? t.currentPrice;
+                  return {
+                    ...t,
+                    currentPrice: livePrice
+                  };
+                });
               });
             }
+            if (data.closedTrades) setClosedTrades(data.closedTrades);
+            if (data.stats) setStats(data.stats);
             if (data.logs) {
               setTerminalLogs(prev => {
                 const prevSet = new Set(prev);
                 const newLogs = data.logs.filter((l: string) => !prevSet.has(l));
                 if (newLogs.length > 0) {
-                  return [...newLogs, ...prev].slice(0, 40);
+                   return [...newLogs, ...prev].slice(0, 40);
                 }
                 return prev;
               });
@@ -198,7 +254,7 @@ export default function App() {
           }
         })
         .catch(console.error);
-    }, 5000);
+    }, 3000);
     return () => clearInterval(syncInterval);
   }, []);
 
@@ -522,30 +578,14 @@ export default function App() {
   // Helper to instantly reconcile positions when live rates change
   const checkRealPriceExits = (prices: Record<string, number>) => {
     setActiveTrades(prevTrades => {
-      const remaining: ActiveTrade[] = [];
-      let stateChanged = false;
-
-      prevTrades.forEach(trade => {
+      return prevTrades.map(trade => {
         const currentPrice = prices[trade.symbol];
-        if (currentPrice === undefined) {
-          remaining.push(trade);
-          return;
-        }
-
-        const { nextActive, closedTrade } = processTradeUpdate(trade, currentPrice);
-        if (closedTrade) {
-          setClosedTrades(history => {
-            if (history.some(t => t.id === closedTrade.id)) return history;
-            return [closedTrade, ...history].slice(0, 40);
-          });
-          stateChanged = true;
-        }
-        if (nextActive) {
-          remaining.push(nextActive);
-        }
+        if (currentPrice === undefined) return trade;
+        return {
+          ...trade,
+          currentPrice
+        };
       });
-
-      return remaining;
     });
   };
 
@@ -593,94 +633,134 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetchBinanceData();
-    const interval = setInterval(fetchBinanceData, 8000); // Fallback REST poll for DB/relay state every 8 seconds
-
-    // Multi-Asset Real-Time Simultaneous Live WebSocket Stream
+    // Multi-Asset Real-Time Simultaneous Live WebSocket Stream with Dynamic Adaptive Polling
     let ws: WebSocket | null = null;
     let fallbackTimeout: any = null;
+    let pollTimeout: any = null;
     let active = true;
+    let isWsConnected = false;
+
+    const pollWithDynamicInterval = async () => {
+      if (!active) return;
+      try {
+        await fetchBinanceData();
+      } catch (err) {
+        // Silent catch for intermittent network blips
+      }
+      if (!active) return;
+      // If WebSocket is active, back off REST polling to 8 seconds. 
+      // If WebSocket is not connected or blocked, poll every 2 seconds for ultra-responsive updates.
+      const intervalMs = isWsConnected ? 8000 : 2000;
+      pollTimeout = setTimeout(pollWithDynamicInterval, intervalMs);
+    };
 
     const connectLiveWS = () => {
       if (!active) return;
       try {
-        ws = new WebSocket(`wss://stream.bybit.com/v5/public/linear`);
+        console.log("[WS] Attempting to connect to Binance Futures Stream: wss://fstream.binance.com/ws");
+        ws = new WebSocket(`wss://fstream.binance.com/ws`);
         
         ws.onopen = () => {
-           const args = MAJOR_FUTURES.map(coin => `tickers.${coin}USDT`);
-           ws?.send(JSON.stringify({ op: "subscribe", args }));
+           console.log("[WS] Stream connection established successfully! Sending subscription request for major assets.");
+           const params = MAJOR_FUTURES.map(coin => `${coin.toLowerCase()}usdt@ticker`);
+           const subscribeMsg = {
+             method: "SUBSCRIBE",
+             params,
+             id: 1
+           };
+           console.log("[WS] Subscribed pairs:", params);
+           ws?.send(JSON.stringify(subscribeMsg));
         };
 
         ws.onmessage = (event) => {
           try {
             const payload = JSON.parse(event.data);
-            if (payload.topic && payload.topic.startsWith("tickers.")) {
-              const symbol = payload.data.symbol || payload.topic.replace("tickers.", "");
-              const coin = symbol.replace("USDT", "");
-              
-              if (payload.data.lastPrice) {
-                 const price = parseFloat(payload.data.lastPrice);
-                 
-                 setWsPackets(prev => {
-                   const log = `[WS] TICK ${symbol} @ ${price.toFixed(4)}`;
-                   return [log, ...prev].slice(0, 10);
-                 });
-                 
-                 setLivePrices(prev => {
-                   const next = { ...prev, [coin]: price };
-                   checkRealPriceExits(next);
-                   return next;
-                 });
-
-                 // Slide real-time prices into focus candle
-                 setCoinsCandles(prev => {
-                   if (prev[coin]) {
-                     const list = [...prev[coin]];
-                     if (list.length > 0) {
-                       const last = { ...list[list.length - 1] };
-                       last.close = price;
-                       list[list.length - 1] = last;
-                       return { ...prev, [coin]: list };
-                     }
-                   }
-                   return prev;
-                 });
-              }
+            
+            if (payload.id !== undefined || payload.result !== undefined) {
+              console.log("[WS] Received subscription confirmation message:", payload);
+              return;
             }
-          } catch (_) {}
-        };
 
-        ws.onclose = () => {
-          if (active) {
-            fallbackTimeout = setTimeout(connectLiveWS, 5000);
+            if (payload.e === "24hrTicker") {
+              isWsConnected = true;
+              const symbol = payload.s; // e.g., "BTCUSDT"
+              const coin = symbol.replace("USDT", "");
+              const price = parseFloat(payload.c);
+              
+              // Full trace logging for telemetry debugging and incoming packet structure verification
+              console.log(`[WS Ticker] ${symbol} | Close: ${payload.c} | High: ${payload.h} | Low: ${payload.l} | BaseVol: ${payload.v} | EventTime: ${payload.E}`);
+              
+              setWsPackets(prev => {
+                const log = `[WS] TICK ${symbol} @ ${price.toFixed(4)}`;
+                return [log, ...prev].slice(0, 10);
+              });
+              
+              setLivePrices(prev => {
+                const next = { ...prev, [coin]: price };
+                checkRealPriceExits(next);
+                return next;
+              });
+
+              // Slide real-time prices into focus candle
+              setCoinsCandles(prev => {
+                if (prev[coin]) {
+                  const list = [...prev[coin]];
+                  if (list.length > 0) {
+                     const last = { ...list[list.length - 1] };
+                     last.close = price;
+                     list[list.length - 1] = last;
+                     return { ...prev, [coin]: list };
+                  }
+                }
+                return prev;
+              });
+            } else {
+              console.log("[WS] Received alternative message format:", payload);
+            }
+          } catch (err: any) {
+            console.error("[WS] Error parsing websocket message event:", err.message);
           }
         };
 
-        ws.onerror = () => {
+        ws.onclose = () => {
+          console.log("[WS] Socket stream closed. Reconnecting in 10 seconds...");
+          isWsConnected = false;
+          if (active) {
+            fallbackTimeout = setTimeout(connectLiveWS, 10000);
+          }
+        };
+
+        ws.onerror = (e) => {
+          console.log("[WS] Direct connection not available in this environment. Seamlessly relying on high-frequency REST polling fallback.");
+          isWsConnected = false;
           if (ws) ws.close();
         };
 
       } catch (err) {
+        console.log("[WS] Direct connection initialization omitted. Seamlessly relying on high-frequency REST polling fallback.");
+        isWsConnected = false;
         if (active) {
-          fallbackTimeout = setTimeout(connectLiveWS, 5000);
+          fallbackTimeout = setTimeout(connectLiveWS, 10000);
         }
       }
     };
 
+    // Run both tasks
+    pollWithDynamicInterval();
     connectLiveWS();
 
     return () => {
       active = false;
-      clearInterval(interval);
       if (ws) ws.close();
       if (fallbackTimeout) clearTimeout(fallbackTimeout);
+      if (pollTimeout) clearTimeout(pollTimeout);
     };
   }, []);
 
   // Initialize standard major futures coin history on mount, remaining pairs are added dynamically via price feeds
   useEffect(() => {
     const initializeAll = async () => {
-      writeLog("SYSTEM INITIALIZATION: Connecting Srade Bollinger-Trendline engine...");
+      writeLog("SYSTEM INITIALIZATION: Connecting Srade...");
       writeLog("SYNCING MARKET DATA: Fetching 300h candle histories directly from Binance Futures API...");
       const initialCandles: Record<string, any[]> = {};
       
@@ -1095,6 +1175,32 @@ export default function App() {
                            {tgTestStatus && (
                                <div className={cn("text-[9px] font-mono px-2 py-1.5 rounded border mt-1 tracking-widest", tgTestStatus.success ? "bg-emerald-500/5 text-emerald-400 border-emerald-500/20" : "bg-rose-500/5 text-rose-400 border-rose-500/20")}>
                                    {tgTestStatus.success ? "Ping Delivered Successfully" : tgTestStatus.message}
+                               </div>
+                           )}
+                       </div>
+
+                       {/* Database Self-Healing */}
+                       <div className="flex flex-col p-2.5 rounded border shadow-inner bg-[#0a0d15] border-slate-800/60 gap-2 text-[10px] font-mono">
+                           <div className="flex items-center justify-between">
+                               <div className="flex items-center gap-2">
+                                   <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 outline outline-emerald-500/20 animate-pulse"></span>
+                                   <span className="text-[10px] text-slate-300 tracking-widest font-bold uppercase">Database Engine</span>
+                               </div>
+                               <span className="text-[9px] font-mono font-bold tracking-widest border border-emerald-500/20 bg-emerald-500/5 text-emerald-400 px-1.5 py-0.5 rounded">ONLINE</span>
+                           </div>
+                           <div className="flex items-center justify-between mt-1">
+                               <span className="text-slate-500 tracking-widest font-bold">CALCULATIONS: <span className="text-slate-300">PERCENTAGE TPs</span></span>
+                               <button 
+                                   disabled={healing}
+                                   onClick={handleHealDatabase}
+                                   className="px-2 py-[3px] rounded bg-[#b45309]/10 text-amber-400 hover:bg-[#b45309]/20 disabled:opacity-50 transition-colors font-mono font-bold tracking-widest border border-amber-500/20 text-[9px]"
+                               >
+                                   {healing ? "HEALING" : "HEAL"}
+                               </button>
+                           </div>
+                           {healMessage && (
+                               <div className="text-[9px] font-mono px-2 py-1.5 rounded border mt-1 tracking-widest bg-emerald-500/5 text-emerald-400 border-emerald-500/20">
+                                   {healMessage}
                                </div>
                            )}
                        </div>

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: srade-engine
+    name: srade
     env: node
     buildCommand: npm install && npm run build
     startCommand: npm start

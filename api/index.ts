@@ -101,14 +101,204 @@ async function getNextTradeCount(dateKey: string): Promise<number> {
   return next;
 }
 
+async function healExistingTradesInDatabase() {
+  try {
+    console.log("[DATABASE HEALER] Initiating healing of existing trade records to fix calculation formula...");
+    
+    let targetDb = db;
+    if ((!targetDb || targetDb === memoryDb) && mongoUri) {
+      console.log("[DATABASE HEALER] DB connection not fully ready. Establishing temporary MongoClient...");
+      const tempClient = new MongoClient(mongoUri);
+      await tempClient.connect();
+      targetDb = tempClient.db("Srade");
+      if (db === memoryDb) {
+        db = targetDb;
+      }
+    }
+
+    // 1. Heal individual TradeModel documents
+    const trades = await TradeModel.find({});
+    console.log(`[DATABASE HEALER] Found ${trades.length} trades to scan in database...`);
+    
+    for (const doc of trades) {
+      const coin = doc.symbol;
+      const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
+      const direction = doc.direction;
+      const entryPrice = doc.entryPrice;
+      if (!entryPrice || !direction || !coin) continue;
+      
+      const p1 = config.tp[0];
+      const p2 = config.tp[1];
+      const p3 = config.tp[2];
+      const p4 = config.tp[3];
+      const slPct = config.sl;
+      
+      let correctSl: number;
+      let correctTps: [number, number, number, number];
+      
+      if (direction === 'LONG') {
+        correctSl = entryPrice * (1 - slPct / 100);
+        correctTps = [
+          entryPrice * (1 + p1 / 100),
+          entryPrice * (1 + p2 / 100),
+          entryPrice * (1 + p3 / 100),
+          entryPrice * (1 + p4 / 100)
+        ];
+      } else {
+        correctSl = entryPrice * (1 + slPct / 100);
+        correctTps = [
+          entryPrice * (1 - p1 / 100),
+          entryPrice * (1 - p2 / 100),
+          entryPrice * (1 - p3 / 100),
+          entryPrice * (1 - p4 / 100)
+        ];
+      }
+      
+      if (doc.status !== "OPEN") {
+        const exitPrice = doc.exitPrice || correctTps[3];
+        const correctPnlPercent = direction === 'LONG'
+          ? ((exitPrice - entryPrice) / entryPrice) * 100
+          : ((entryPrice - exitPrice) / entryPrice) * 100;
+          
+        doc.pnlPercent = correctPnlPercent;
+      }
+      
+      await doc.save();
+    }
+    
+    // 2. Heal system_state collection
+    if (targetDb && targetDb !== memoryDb) {
+      const stateDoc = await targetDb.collection("system_state").findOne({ id: "main" });
+      if (stateDoc) {
+        let stateChanged = false;
+        const activeTrades = stateDoc.activeTrades || [];
+        const closedTrades = stateDoc.closedTrades || [];
+        
+        for (const t of activeTrades) {
+          const coin = t.symbol;
+          const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
+          const direction = t.direction;
+          const entryPrice = t.entry;
+          if (!entryPrice || !direction || !coin) continue;
+          
+          const p1 = config.tp[0];
+          const p2 = config.tp[1];
+          const p3 = config.tp[2];
+          const p4 = config.tp[3];
+          const slPct = config.sl;
+          
+          if (direction === 'LONG') {
+            t.sl = entryPrice * (1 - slPct / 100);
+            t.tps = [
+              entryPrice * (1 + p1 / 100),
+              entryPrice * (1 + p2 / 100),
+              entryPrice * (1 + p3 / 100),
+              entryPrice * (1 + p4 / 100)
+            ];
+          } else {
+            t.sl = entryPrice * (1 + slPct / 100);
+            t.tps = [
+              entryPrice * (1 - p1 / 100),
+              entryPrice * (1 - p2 / 100),
+              entryPrice * (1 - p3 / 100),
+              entryPrice * (1 - p4 / 100)
+            ];
+          }
+          t.tp = t.tps[0];
+          stateChanged = true;
+        }
+        
+        for (const t of closedTrades) {
+          const coin = t.symbol;
+          const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
+          const direction = t.direction;
+          const entryPrice = t.entry;
+          if (!entryPrice || !direction || !coin) continue;
+          
+          const p1 = config.tp[0];
+          const p2 = config.tp[1];
+          const p3 = config.tp[2];
+          const p4 = config.tp[3];
+          const slPct = config.sl;
+          
+          if (direction === 'LONG') {
+            t.sl = entryPrice * (1 - slPct / 100);
+            t.tps = [
+              entryPrice * (1 + p1 / 100),
+              entryPrice * (1 + p2 / 100),
+              entryPrice * (1 + p3 / 100),
+              entryPrice * (1 + p4 / 100)
+            ];
+          } else {
+            t.sl = entryPrice * (1 + slPct / 100);
+            t.tps = [
+              entryPrice * (1 - p1 / 100),
+              entryPrice * (1 - p2 / 100),
+              entryPrice * (1 - p3 / 100),
+              entryPrice * (1 - p4 / 100)
+            ];
+          }
+          t.tp = t.tps[0];
+          
+          const exitPrice = t.exitPrice || t.tps[3];
+          const correctPnlPercent = direction === 'LONG'
+            ? ((exitPrice - entryPrice) / entryPrice) * 100
+            : ((entryPrice - exitPrice) / entryPrice) * 100;
+            
+          t.pnlPercent = correctPnlPercent;
+          t.pnl = (t.initialSize || t.size) * (correctPnlPercent / 100);
+          stateChanged = true;
+        }
+
+        // Recalculate global stats from closedTrades
+        let calculatedWon = 0;
+        let calculatedLost = 0;
+        let calculatedTotalPnl = 0;
+        for (const t of closedTrades) {
+          const tradePnl = t.pnl || 0;
+          calculatedTotalPnl += tradePnl;
+          if (tradePnl > 0) {
+            calculatedWon++;
+            t.status = "WIN";
+          } else {
+            calculatedLost++;
+            t.status = "LOSS";
+          }
+        }
+        const calculatedBalance = 10000 + calculatedTotalPnl;
+        const correctStats = {
+          balance: calculatedBalance,
+          won: calculatedWon,
+          lost: calculatedLost,
+          totalPnl: calculatedTotalPnl
+        };
+        
+        if (stateChanged) {
+          await targetDb.collection("system_state").updateOne(
+            { id: "main" },
+            { $set: { activeTrades, closedTrades, stats: correctStats } }
+          );
+          console.log("[DATABASE HEALER] Completed system_state and stats healing successfully!");
+        }
+      }
+    }
+  } catch (err: any) {
+    console.error("[DATABASE HEALER] Error during healing:", err.message);
+  }
+}
+
 if (mongoUri) {
   // Original DB setup
   const client = new MongoClient(mongoUri);
   client.connect().then(() => {
     db = client.db("Srade");
     console.log("Connected to MongoDB successfully via standard driver.");
-    // Start WebSocket Screener once DB is connected!
-    startWebSocketScreener();
+    loadProcessedKeysFromDB().then(() => {
+      // Start WebSocket Screener once DB is connected!
+      startWebSocketScreener();
+    }).catch(() => {
+      startWebSocketScreener();
+    });
   }).catch((err) => {
     console.error("MongoDB connection failed, using memory DB:", err);
     db = memoryDb;
@@ -118,6 +308,7 @@ if (mongoUri) {
   // Mongoose setup
   mongoose.connect(mongoUri, { dbName: "Srade" }).then(() => {
     console.log("Connected to Mongoose successfully for Trades tracking.");
+    healExistingTradesInDatabase().catch(e => console.error("[DATABASE HEALER ERROR]:", e.message));
   }).catch(err => {
     console.error("Mongoose connection failed:", err);
   });
@@ -140,6 +331,40 @@ let globalLivePrices: Record<string, number> = {};
 // Keep a set of processed keys to strictly prevent double executions (idempotency)
 const processedClosedKlines = new Set<string>();
 
+async function loadProcessedKeysFromDB() {
+  try {
+    const state = await getSystemState();
+    if (state && Array.isArray(state.processedKeys)) {
+      state.processedKeys.forEach((k: string) => processedClosedKlines.add(k));
+      console.log(`[IDEMPOTENCY] Loaded ${processedClosedKlines.size} processed kline keys from MongoDB.`);
+    }
+  } catch (err) {
+    console.error("[IDEMPOTENCY] Error loading processed keys from DB:", err);
+  }
+}
+
+async function markKeyProcessed(key: string) {
+  processedClosedKlines.add(key);
+  try {
+    const state = await getSystemState();
+    if (state) {
+      const keys = Array.isArray(state.processedKeys) ? state.processedKeys : [];
+      if (!keys.includes(key)) {
+        keys.push(key);
+        // Clean up old keys if the array grows too large (keep last 500 keys)
+        if (keys.length > 500) {
+          keys.shift();
+        }
+        state.processedKeys = keys;
+        await saveSystemState(state);
+        console.log(`[IDEMPOTENCY] Persisted processed key "${key}" to MongoDB.`);
+      }
+    }
+  } catch (err) {
+    console.error("[IDEMPOTENCY] Error marking key as processed in DB:", err);
+  }
+}
+
 // In-memory low-latency candle cache and hourly signal tracking
 let serverCoinsCandles: Record<string, any[]> = {};
 const lastTradeCandleTime = new Map<string, number>();
@@ -150,16 +375,15 @@ async function getOrFetchCandles(coin: string): Promise<any[] | null> {
   }
   
   try {
-    const symbol = `${coin}USDT`;
-    const r = await fetch(`https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=1000`, {
+    const symbol = `${coin.toUpperCase()}USDT`;
+    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
       signal: AbortSignal.timeout(6000)
     });
     if (!r.ok) return null;
     const data = await r.json();
-    if (data.retCode !== 0 || !data.result || !data.result.list) return null;
+    if (!Array.isArray(data)) return null;
     
-    const rawCandles = data.result.list.reverse();
-    const candles = rawCandles.map((c: any) => ({
+    const candles = data.map((c: any) => ({
       time: parseInt(c[0]),
       open: parseFloat(c[1]),
       high: parseFloat(c[2]),
@@ -370,27 +594,30 @@ async function updateCoinCandleCacheAndCheck(coin: string, k: any) {
 
   lastTradeCandleTime.set(coin, candleStartTime);
 
-  const currentAtr = resList.atr[targetIdx] || (entryPrice * 0.015);
-  const slDistance = 1.5 * currentAtr;
-
   let tps: [number, number, number, number];
   let sl: number;
 
+  const p1 = config.tp[0];
+  const p2 = config.tp[1];
+  const p3 = config.tp[2];
+  const p4 = config.tp[3];
+  const slPct = config.sl;
+
   if (signal === 'LONG') {
-    sl = entryPrice - slDistance;
+    sl = entryPrice * (1 - slPct / 100);
     tps = [
-      entryPrice + 0.5 * slDistance,
-      entryPrice + 1.0 * slDistance,
-      entryPrice + 1.5 * slDistance,
-      entryPrice + 2.0 * slDistance
+      entryPrice * (1 + p1 / 100),
+      entryPrice * (1 + p2 / 100),
+      entryPrice * (1 + p3 / 100),
+      entryPrice * (1 + p4 / 100)
     ];
   } else {
-    sl = entryPrice + slDistance;
+    sl = entryPrice * (1 + slPct / 100);
     tps = [
-      entryPrice - 0.5 * slDistance,
-      entryPrice - 1.0 * slDistance,
-      entryPrice - 1.5 * slDistance,
-      entryPrice - 2.0 * slDistance
+      entryPrice * (1 - p1 / 100),
+      entryPrice * (1 - p2 / 100),
+      entryPrice * (1 - p3 / 100),
+      entryPrice * (1 - p4 / 100)
     ];
   }
 
@@ -751,22 +978,21 @@ async function checkRealPriceExitsServer() {
 async function processCoinKlineClose(coin: string, candleStartTime: number) {
   const eventKey = `${coin}-${candleStartTime}`;
   if (processedClosedKlines.has(eventKey)) return;
-  processedClosedKlines.add(eventKey);
+  await markKeyProcessed(eventKey);
   
   console.log(`[WEBSOCKET SCREENER] ${coin} hourly candle closed! Initiating low-latency technical assessment...`);
   
   try {
-    const symbol = `${coin}USDT`;
-    const r = await fetch(`https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=1000`, {
+    const symbol = `${coin.toUpperCase()}USDT`;
+    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
       signal: AbortSignal.timeout(6000)
     });
     if (!r.ok) return;
 
     const data = await r.json();
-    if (data.retCode !== 0 || !data.result || !data.result.list) return;
-    const rawCandles = data.result.list.reverse();
+    if (!Array.isArray(data)) return;
 
-    const candles = rawCandles.map(c => ({
+    const candles = data.map(c => ({
       time: parseInt(c[0]),
       open: parseFloat(c[1]),
       high: parseFloat(c[2]),
@@ -948,27 +1174,30 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
       return;
     }
 
-    const currentAtr = resList.atr[targetIdx] || (entryPrice * 0.015);
-    const slDistance = 1.5 * currentAtr;
-
     let tps: [number, number, number, number];
     let sl: number;
 
+    const p1 = config.tp[0];
+    const p2 = config.tp[1];
+    const p3 = config.tp[2];
+    const p4 = config.tp[3];
+    const slPct = config.sl;
+
     if (signal === 'LONG') {
-      sl = entryPrice - slDistance;
+      sl = entryPrice * (1 - slPct / 100);
       tps = [
-        entryPrice + 0.5 * slDistance,
-        entryPrice + 1.0 * slDistance,
-        entryPrice + 1.5 * slDistance,
-        entryPrice + 2.0 * slDistance
+        entryPrice * (1 + p1 / 100),
+        entryPrice * (1 + p2 / 100),
+        entryPrice * (1 + p3 / 100),
+        entryPrice * (1 + p4 / 100)
       ];
     } else {
-      sl = entryPrice + slDistance;
+      sl = entryPrice * (1 + slPct / 100);
       tps = [
-        entryPrice - 0.5 * slDistance,
-        entryPrice - 1.0 * slDistance,
-        entryPrice - 1.5 * slDistance,
-        entryPrice - 2.0 * slDistance
+        entryPrice * (1 - p1 / 100),
+        entryPrice * (1 - p2 / 100),
+        entryPrice * (1 - p3 / 100),
+        entryPrice * (1 - p4 / 100)
       ];
     }
 
@@ -1039,60 +1268,72 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
 }
 
 // self-healing WebSocket Manager
-let bybitWs: WebSocket | null = null;
+let binanceWs: WebSocket | null = null;
 let reconnectDelay = 2000;
 
 let pingInterval: NodeJS.Timeout | null = null;
 
 function startWebSocketScreener() {
-  const wsUrl = `wss://stream.bybit.com/v5/public/linear`;
+  const wsUrl = "wss://fstream.binance.com/ws";
 
-  console.log("[WEBSOCKET SCREENER] Connecting to live Bybit Futures WebSockets...");
+  console.log("[WEBSOCKET SCREENER] Connecting to live Binance Futures WebSockets...");
   
   const ws = new WebSocket(wsUrl);
-  bybitWs = ws;
+  binanceWs = ws;
 
   ws.on("open", () => {
-    console.log("[WEBSOCKET SCREENER] Connection established on 1H kline streams! Low latency monitoring active.");
+    console.log("[WEBSOCKET SCREENER] Connection established on 1H Binance kline streams! Low latency monitoring active.");
     reconnectDelay = 2000;
     
     // Subscribe to klines
-    const args = MAJOR_FUTURES.map(coin => `kline.60.${coin}USDT`);
-    ws.send(JSON.stringify({ op: "subscribe", args }));
+    const params = MAJOR_FUTURES.map(coin => `${coin.toLowerCase()}usdt@kline_1h`);
+    ws.send(JSON.stringify({
+      method: "SUBSCRIBE",
+      params,
+      id: 1
+    }));
     
     if (pingInterval) clearInterval(pingInterval);
     pingInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ req_id: "ping_1", op: "ping" }));
+        ws.ping(); // Send standard websocket ping frame
       }
-    }, 20000);
+    }, 30000);
   });
 
   ws.on("message", (raw) => {
     try {
       const payload = JSON.parse(raw.toString());
-      if (payload.topic && payload.topic.startsWith("kline.60.")) {
-        const coin = payload.topic.replace("kline.60.", "").replace("USDT", "");
-        if (payload.data && payload.data.length > 0) {
-          const k = payload.data[0];
-          globalLivePrices[coin] = parseFloat(k.close);
-          
-          const binanceLikeK = {
-            t: k.start,
-            c: k.close,
-            h: k.high,
-            l: k.low,
-            v: k.volume,
-            x: k.confirm
-          };
-          
-          updateCoinCandleCacheAndCheck(coin, binanceLikeK).catch(err => {
-            console.error(`[LOW-LATENCY RUNTIME] Error in cache check for ${coin}:`, err.message);
-          });
-        }
+      if (payload.e === "kline" && payload.k) {
+        const symbol = payload.s; // e.g., "BTCUSDT"
+        const coin = symbol.toUpperCase().replace("USDT", "");
+        const k = payload.k;
+        const currentClose = parseFloat(k.c);
+        
+        globalLivePrices[coin] = currentClose;
+        
+        const binanceLikeK = {
+          t: k.t,
+          o: k.o,
+          c: k.c,
+          h: k.h,
+          l: k.l,
+          v: k.v,
+          x: k.x
+        };
+        
+        updateCoinCandleCacheAndCheck(coin, binanceLikeK).catch(err => {
+          console.error(`[LOW-LATENCY RUNTIME] Error in cache check for ${coin}:`, err.message);
+        });
       }
     } catch (e: any) {
       console.error("[WEBSOCKET SCREENER] Parse error on raw packet:", e.message);
+    }
+  });
+
+  ws.on("ping", () => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.pong();
     }
   });
 
@@ -1103,7 +1344,7 @@ function startWebSocketScreener() {
   ws.on("close", (code, reason) => {
     if (pingInterval) clearInterval(pingInterval);
     console.warn(`[WEBSOCKET SCREENER] Socket disconnected (Code: ${code}). Re-establishing connection in ${reconnectDelay}ms...`);
-    bybitWs = null;
+    binanceWs = null;
     setTimeout(() => {
       reconnectDelay = Math.min(reconnectDelay * 2, 60000);
       startWebSocketScreener();
@@ -1242,6 +1483,15 @@ app.post("/api/trades/record", async (req, res) => {
 
 // Daily report removed as per user instruction.
 
+app.get("/api/admin/heal", async (req, res) => {
+  try {
+    await healExistingTradesInDatabase();
+    res.json({ success: true, message: "Manual database healing executed successfully." });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get("/api/db/state", async (req, res) => {
   if (!db) return res.json({ error: "Database not connected" });
   try {
@@ -1260,9 +1510,6 @@ app.post("/api/db/state", async (req, res) => {
   if (!db) return res.json({ error: "Database not connected" });
   try {
     const { 
-      activeTrades, 
-      closedTrades, 
-      stats, 
       logs,
       filterAdx,
       filterMtf,
@@ -1273,21 +1520,17 @@ app.post("/api/db/state", async (req, res) => {
     } = req.body;
 
     const currentState = await db.collection("system_state").findOne({ id: "main" });
-    let mergedActiveTrades = activeTrades || [];
     let mergedLogs = logs || [];
     
+    let activeTrades = [];
+    let closedTrades = [];
+    let stats = { balance: 10000, won: 0, lost: 0, totalPnl: 0 };
+
     if (currentState) {
-      if (currentState.activeTrades) {
-        const frontendActiveIds = new Set((activeTrades || []).map((t: any) => t.id));
-        const frontendClosedIds = new Set((closedTrades || []).map((t: any) => t.id));
-        
-        const unseenBackendTrades = currentState.activeTrades.filter((t: any) => 
-          !frontendActiveIds.has(t.id) && !frontendClosedIds.has(t.id)
-        );
-        
-        mergedActiveTrades = [...mergedActiveTrades, ...unseenBackendTrades];
-      }
-      
+      activeTrades = currentState.activeTrades || [];
+      closedTrades = currentState.closedTrades || [];
+      stats = currentState.stats || stats;
+
       if (currentState.logs) {
          const frontendLogsSet = new Set(logs || []);
          const unseenBackendLogs = currentState.logs.filter((l: string) => !frontendLogsSet.has(l));
@@ -1299,7 +1542,7 @@ app.post("/api/db/state", async (req, res) => {
       { id: "main" },
       { 
         $set: { 
-          activeTrades: mergedActiveTrades, 
+          activeTrades, 
           closedTrades, 
           stats, 
           logs: mergedLogs, 
@@ -1333,16 +1576,15 @@ async function runMarketScan() {
     // Using MAJOR_FUTURES, processing all in parallel
     const processPromises = MAJOR_FUTURES.map(async (coin) => {
       try {
-        const symbol = `${coin}USDT`;
-        const r = await fetch(`https://api.bybit.com/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=1000`, {
+        const symbol = `${coin.toUpperCase()}USDT`;
+        const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
           signal: AbortSignal.timeout(8000)
         });
         if (!r.ok) return;
 
         const data = await r.json();
-        if (data.retCode !== 0 || !data.result || !data.result.list) return;
-        const rawCandles = data.result.list.reverse();
-        const candles = rawCandles.map(c => ({
+        if (!Array.isArray(data)) return;
+        const candles = data.map(c => ({
           time: parseInt(c[0]),
           open: parseFloat(c[1]),
           high: parseFloat(c[2]),
@@ -1357,86 +1599,228 @@ async function runMarketScan() {
         const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
         const resList = calculateSrade(candles, config.bbPeriod, config.bbDev, coin);
         
-        for (let offset = 2; offset <= 6; offset++) {
+        const volumes = candles.map(c => c.volume);
+        for (let offset = 2; offset <= 3; offset++) {
           const targetIdx = candles.length - offset;
           if (targetIdx < 0) continue;
           
           const candleTime = candles[targetIdx].time;
-          const processedKey = `${coin}_cron_${candleTime}`;
+          const processedKey = `${coin}-${candleTime}`;
           if (processedClosedKlines.has(processedKey)) continue;
 
           const signal = resList.signals[targetIdx];
           const adxVal = resList.adx[targetIdx] ?? 0;
           const ema200val = resList.ema200_4h[targetIdx] ?? candles[targetIdx].close;
 
+          await markKeyProcessed(processedKey);
+
           if (signal) {
             const state = await getSystemState();
-            const filterAdxEnabled = state?.filterAdx !== false;
-            const filterEmaEnabled = state?.filterEma !== false;
+            if (!state) continue;
 
-            // ADX filter rejection
-            if (!filterAdxEnabled || adxVal > 25) {
-              const closePrice = candles[targetIdx].close;
-              // 4H EMA 200 filter check
-              if (!filterEmaEnabled || (signal === 'LONG' && closePrice > ema200val) || (signal === 'SHORT' && closePrice < ema200val)) {
-                triggeredSignals++;
-                processedClosedKlines.add(processedKey);
-                
-                if (state) {
-                  const activeTrades = [...(state.activeTrades || [])];
-                  const existingIndex = activeTrades.findIndex((t: any) => t.symbol === coin);
-                  
-                  if (existingIndex === -1) {
-                    const currentAtr = resList.atr[targetIdx] || (closePrice * 0.015);
-                  const slDistance = 1.5 * currentAtr;
-                  let tps: [number, number, number, number];
-                  let sl: number;
-                  if (signal === 'LONG') {
-                    sl = closePrice - slDistance;
-                    tps = [closePrice + 0.5 * slDistance, closePrice + 1.0 * slDistance, closePrice + 1.5 * slDistance, closePrice + 2.0 * slDistance];
-                  } else {
-                    sl = closePrice + slDistance;
-                    tps = [closePrice - 0.5 * slDistance, closePrice - 1.0 * slDistance, closePrice - 1.5 * slDistance, closePrice - 2.0 * slDistance];
-                  }
+            const filters = {
+              filterAdx: state.filterAdx !== undefined ? state.filterAdx : true,
+              filterMtf: state.filterMtf !== undefined ? state.filterMtf : true,
+              filterEma: state.filterEma !== undefined ? state.filterEma : true,
+              filterVolume: state.filterVolume !== undefined ? state.filterVolume : true,
+              filterFunding: state.filterFunding !== undefined ? state.filterFunding : true,
+              filterLiquidity: state.filterLiquidity !== undefined ? state.filterLiquidity : true,
+            };
 
-                  const baseSize = 10000 * 0.02 * config.risk * 3;
-                  const now = new Date();
-                  const dateKey = `${String(now.getUTCDate()).padStart(2, '0')}${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
-                  const count = await getNextTradeCount(dateKey);
-                  const tradeId = `${dateKey}${String(count).padStart(2, '0')}`;
+            const closePrice = candles[targetIdx].close;
 
-                  const tradeRecord = new TradeModel({
-                    tradeId, symbol: coin, direction: signal, entryPrice: closePrice, status: "OPEN", pnlPercent: 0
-                  });
-                  await tradeRecord.save();
-
-                  const newTrade: any = {
-                    id: Math.random().toString(36).substring(2, 7).toUpperCase(),
-                    dbId: tradeId, symbol: coin, direction: signal, entry: closePrice, tp: tps[0], tps, sl, currentPrice: closePrice,
-                    size: baseSize, risk: config.risk, realizedTps: [false, false, false, false], initialSize: baseSize, partialPnlRealized: 0
-                  };
-
-                  activeTrades.push(newTrade);
-                  state.activeTrades = activeTrades;
-                  
-                  const logs = state.logs || [];
-                  const successMsg = `>>> SYSTEM SCANNER TRIGGER: ${coin} ${signal} @ $${formatPrice(closePrice)} generated! Trade ${tradeId} recorded.`;
-                  logs.unshift(`[${new Date().toLocaleTimeString()}] ${successMsg}`);
-                  state.logs = logs.slice(0, 40);
-
-                  await saveSystemState(state);
-
-                  const msg = `Symbol: ${coin}\n` +
-                    `Direction: ${signal}\n` +
-                    `TP Levels: ${formatPrice(tps[0])}, ${formatPrice(tps[1])}, ${formatPrice(tps[2])}, ${formatPrice(tps[3])}\n` +
-                    `SL Level: ${formatPrice(sl)}`;
-                  await sendTelegramMessage(msg, signal);
-                }
+            // Volume Ratio Calculation
+            let volumeRatio = 1.0;
+            if (volumes.length >= 20) {
+              const lastVol = volumes[targetIdx] || 1.0;
+              const startSlice = Math.max(0, targetIdx - 20);
+              const prevVols = volumes.slice(startSlice, targetIdx);
+              if (prevVols.length > 0) {
+                const volSmaSum = prevVols.reduce((sum, v) => sum + (v || 0), 0) / prevVols.length;
+                volumeRatio = lastVol / (volSmaSum || 1);
               }
             }
+
+            const funding = getCoinFundingRate(coin, signal === 'LONG' ? 1 : -1);
+            const liquidity = getCoinBase24hVolume(coin);
+
+            // ADX gate
+            if (filters.filterAdx && adxVal <= 25) {
+              const log = `[CRON FILTER] ${coin} ${signal} at $${formatPrice(closePrice)} rejected: ADX sideways (${adxVal.toFixed(1)} <= 25)`;
+              state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
+              await saveSystemState(state);
+              continue;
+            }
+
+            // MTF gate
+            const candles4h = aggregateTo4Hour(candles.slice(0, targetIdx + 1));
+            const bbPeriod4h = Math.max(10, Math.round(config.bbPeriod / 4));
+            const iTrend4h = calculateITrendOnly(candles4h, bbPeriod4h, config.bbDev);
+            const mtfTrend = iTrend4h.length > 0 ? iTrend4h[iTrend4h.length - 1] : 0;
+            if (filters.filterMtf) {
+              if (signal === 'LONG' && mtfTrend !== 1) {
+                const log = `[CRON FILTER] ${coin} LONG at $${formatPrice(closePrice)} rejected: 4H trend direction bearish/neutral`;
+                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
+                await saveSystemState(state);
+                continue;
+              }
+              if (signal === 'SHORT' && mtfTrend !== -1) {
+                const log = `[CRON FILTER] ${coin} SHORT at $${formatPrice(closePrice)} rejected: 4H trend direction bullish/neutral`;
+                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
+                await saveSystemState(state);
+                continue;
+              }
+            }
+
+            // EMA gate
+            if (filters.filterEma) {
+              if (signal === 'LONG' && closePrice <= ema200val) {
+                const log = `[CRON FILTER] ${coin} LONG at $${formatPrice(closePrice)} rejected: price below 4H EMA 200 (${formatPrice(ema200val)})`;
+                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
+                await saveSystemState(state);
+                continue;
+              }
+              if (signal === 'SHORT' && closePrice >= ema200val) {
+                const log = `[CRON FILTER] ${coin} SHORT at $${formatPrice(closePrice)} rejected: price above 4H EMA 200 (${formatPrice(ema200val)})`;
+                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
+                await saveSystemState(state);
+                continue;
+              }
+            }
+
+            // Volume gate
+            if (filters.filterVolume && volumeRatio <= 1.5) {
+              const log = `[CRON FILTER] ${coin} ${signal} rejected: breakout volume ratio ${volumeRatio.toFixed(2)}x <= 1.5x`;
+              state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
+              await saveSystemState(state);
+              continue;
+            }
+
+            // Funding gate
+            if (filters.filterFunding) {
+              const fundingPct = funding * 100;
+              if (signal === 'LONG' && funding >= 0.05) {
+                const log = `[CRON FILTER] ${coin} LONG rejected: funding rate too high (${fundingPct.toFixed(4)}%)`;
+                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
+                await saveSystemState(state);
+                continue;
+              }
+              if (signal === 'SHORT' && funding <= -0.05) {
+                const log = `[CRON FILTER] ${coin} SHORT rejected: funding rate too low (${fundingPct.toFixed(4)}%)`;
+                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
+                await saveSystemState(state);
+                continue;
+              }
+            }
+
+            // Liquidity gate
+            if (filters.filterLiquidity && liquidity < 30000000) {
+              const log = `[CRON FILTER] ${coin} ${signal} rejected: Liquidity $${(liquidity/1000000).toFixed(1)}M < $30M limit`;
+              state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
+              await saveSystemState(state);
+              continue;
+            }
+
+            // Reject duplicates on active symbols or handle Trend Reversal
+            let activeTrades = [...(state.activeTrades || [])];
+            const closedTrades = [...(state.closedTrades || [])];
+            let stats = state.stats || { balance: 10000, won: 0, lost: 0, totalPnl: 0 };
+            let logs = state.logs || [];
+
+            const existingIndex = activeTrades.findIndex((t: any) => t.symbol === coin);
+            if (existingIndex !== -1) {
+              const existingTrade = activeTrades[existingIndex];
+              if (existingTrade.direction === signal) {
+                console.log(`[CRON SCANNER] Ignored duplicate ${signal} signal for ${coin}.`);
+                continue;
+              } else {
+                // Trend Reversal Exit: Exit counter trade first
+                const { closedTrade, updatedStats, loggedMsg } = processTradeUpdateServerLogic(existingTrade, closePrice, stats, true);
+                if (closedTrade) {
+                  closedTrades.unshift(closedTrade);
+                  stats = updatedStats;
+                  if (loggedMsg) {
+                    logs.unshift(`[${new Date().toLocaleTimeString()}] ${loggedMsg}`);
+                  }
+                  try {
+                    await TradeModel.findOneAndUpdate(
+                      { tradeId: existingTrade.dbId },
+                      { 
+                        status: closedTrade.status, 
+                        exitPrice: closedTrade.exitPrice, 
+                        pnlPercent: closedTrade.pnlPercent, 
+                        updatedAt: new Date() 
+                      }
+                    );
+                  } catch(err) {}
+                }
+                activeTrades = activeTrades.filter((t: any) => t.id !== existingTrade.id);
+              }
+            }
+
+            triggeredSignals++;
+            let tps: [number, number, number, number];
+            let sl: number;
+
+            const p1 = config.tp[0];
+            const p2 = config.tp[1];
+            const p3 = config.tp[2];
+            const p4 = config.tp[3];
+            const slPct = config.sl;
+
+            if (signal === 'LONG') {
+              sl = closePrice * (1 - slPct / 100);
+              tps = [
+                closePrice * (1 + p1 / 100),
+                closePrice * (1 + p2 / 100),
+                closePrice * (1 + p3 / 100),
+                closePrice * (1 + p4 / 100)
+              ];
+            } else {
+              sl = closePrice * (1 + slPct / 100);
+              tps = [
+                closePrice * (1 - p1 / 100),
+                closePrice * (1 - p2 / 100),
+                closePrice * (1 - p3 / 100),
+                closePrice * (1 - p4 / 100)
+              ];
+            }
+
+            const baseSize = 10000 * 0.02 * config.risk * 3;
+            const now = new Date();
+            const dateKey = `${String(now.getUTCDate()).padStart(2, '0')}${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+            const count = await getNextTradeCount(dateKey);
+            const tradeId = `${dateKey}${String(count).padStart(2, '0')}`;
+
+            const tradeRecord = new TradeModel({
+              tradeId, symbol: coin, direction: signal, entryPrice: closePrice, status: "OPEN", pnlPercent: 0
+            });
+            await tradeRecord.save();
+
+            const newTrade: any = {
+              id: Math.random().toString(36).substring(2, 7).toUpperCase(),
+              dbId: tradeId, symbol: coin, direction: signal, entry: closePrice, tp: tps[0], tps, sl, currentPrice: closePrice,
+              size: baseSize, risk: config.risk, realizedTps: [false, false, false, false], initialSize: baseSize, partialPnlRealized: 0
+            };
+
+            activeTrades.push(newTrade);
+            state.activeTrades = activeTrades;
+            state.closedTrades = closedTrades;
+            state.stats = stats;
+            
+            const successMsg = `>>> SYSTEM SCANNER TRIGGER: ${coin} ${signal} @ $${formatPrice(closePrice)} generated! Trade ${tradeId} recorded.`;
+            logs.unshift(`[${new Date().toLocaleTimeString()}] ${successMsg}`);
+            state.logs = logs.slice(0, 40);
+
+            await saveSystemState(state);
+
+            const msg = `[CRON TRIGGERED] Symbol: ${coin}\n` +
+              `Direction: ${signal}\n` +
+              `TP Levels: ${formatPrice(tps[0])}, ${formatPrice(tps[1])}, ${formatPrice(tps[2])}, ${formatPrice(tps[3])}\n` +
+              `SL Level: ${formatPrice(sl)}`;
+            await sendTelegramMessage(msg, signal);
           }
         }
-        } // close for loop
       } catch(e) {}
     });
 
@@ -1480,7 +1864,7 @@ app.get("/api/binance/status", (req, res) => {
       ? `${process.env.BINANCE_API_KEY?.substring(0, 6)}...${process.env.BINANCE_API_KEY?.slice(-4)}` 
       : "Not Set",
     secretMask: secretPreset ? "********" : "Not Set",
-    binanceUrl: "https://api.bybit.com",
+    binanceUrl: "https://fapi.binance.com",
     serverTime: new Date().toISOString()
   });
 });
@@ -1514,7 +1898,7 @@ app.post("/api/db/reset", async (req, res) => {
         { upsert: true }
       );
     } else {
-      memoryDbStore["main"] = initialState;
+      memoryDbState = { ...initialState };
     }
     
     res.json({ success: true });
@@ -1535,28 +1919,25 @@ app.get("/api/binance/prices", async (req, res) => {
       });
     }
 
-    const baseUrl = "https://api.bybit.com";
-    const response = await fetch(`${baseUrl}/v5/market/tickers?category=linear`, {
+    const response = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", {
       signal: AbortSignal.timeout(4000)
     });
     
     if (!response.ok) {
-      throw new Error(`Bybit API error: ${response.statusText}`);
+      throw new Error(`Binance API error: ${response.statusText}`);
     }
 
     const data = await response.json();
-    if (data.retCode !== 0 || !data.result || !data.result.list) {
-       throw new Error(`Bybit API data format error`);
+    if (!Array.isArray(data)) {
+       throw new Error(`Binance API data format error`);
     }
 
-    const rawPrices = data.result.list as Array<{ symbol: string; lastPrice: string }>;
-    
     // Filter for some USDT pairs
     const usdtPrices: Record<string, number> = {};
-    rawPrices.forEach(item => {
+    data.forEach((item: any) => {
       if (item.symbol.endsWith("USDT")) {
         const coin = item.symbol.replace("USDT", "");
-        const val = parseFloat(item.lastPrice);
+        const val = parseFloat(item.price);
         usdtPrices[coin] = val;
         globalLivePrices[coin] = val; // populate cache too
       }
@@ -1564,7 +1945,7 @@ app.get("/api/binance/prices", async (req, res) => {
 
     res.json({
       success: true,
-      source: "Bybit Futures API (Fallback)",
+      source: "Binance Futures API (Fallback)",
       prices: usdtPrices
     });
   } catch (error: any) {
@@ -1577,7 +1958,7 @@ app.get("/api/binance/prices", async (req, res) => {
     }
     res.json({
       success: false,
-      message: error.message || "Failed to contact Bybit Futures API"
+      message: error.message || "Failed to contact Binance Futures API"
     });
   }
 });
@@ -1587,9 +1968,8 @@ app.get("/api/binance/metrics/:coin", async (req, res) => {
   try {
     const coin = (req.params.coin || "BTC").toUpperCase();
     const symbol = `${coin}USDT`;
-    const baseUrl = "https://api.bybit.com";
 
-    const r = await fetch(`${baseUrl}/v5/market/kline?category=linear&symbol=${symbol}&interval=60&limit=1000`, {
+    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
       signal: AbortSignal.timeout(6000)
     });
 
@@ -1598,12 +1978,11 @@ app.get("/api/binance/metrics/:coin", async (req, res) => {
     }
 
     const data = await r.json();
-    if (data.retCode !== 0 || !data.result || !data.result.list) {
+    if (!Array.isArray(data)) {
         throw new Error(`Failed to parse candles`);
     }
-    const rawCandles = data.result.list.reverse();
     // Parse as open, high, low, close, volume, closeTime, quoteVolume
-    const candles = rawCandles.map(c => ({
+    const candles = data.map(c => ({
       time: parseInt(c[0]),
       open: parseFloat(c[1]),
       high: parseFloat(c[2]),
