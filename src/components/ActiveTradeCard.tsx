@@ -34,7 +34,7 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
 
   // Determine reached status for each target
   const checkTargetReached = (val: number) => {
-    const isValidMove = isLong ? currentPrice > entry * 1.001 : currentPrice < entry * 0.999;
+    const isValidMove = isLong ? currentPrice > entry * 1.0005 : currentPrice < entry * 0.9995;
     return isValidMove && (isLong ? currentPrice >= val : currentPrice <= val);
   };
 
@@ -76,11 +76,11 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
           : 'bg-slate-700/85 border border-slate-900/40'
       };
     }) : [])
-  ].filter(p => p.percent >= 0 && p.percent <= 100);
+  ].filter(p => p.percent >= -0.1 && p.percent <= 100.1);
 
   const points = [];
-  const atZero = rawPoints.filter(p => p.percent === 0);
-  const others = rawPoints.filter(p => p.percent > 0);
+  const atZero = rawPoints.filter(p => Math.abs(p.percent) < 0.1);
+  const others = rawPoints.filter(p => p.percent >= 0.1);
 
   if (atZero.length > 0) {
     const slPoint = atZero.find(p => p.label.startsWith('SL'));

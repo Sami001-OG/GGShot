@@ -204,6 +204,13 @@ async function healExistingTradesInDatabase() {
               entryPrice * (1 - p4 / 100)
             ];
           }
+
+          if (t.realizedTps) {
+            if (t.realizedTps[2]) t.sl = t.tps[1];
+            else if (t.realizedTps[1]) t.sl = t.tps[0];
+            else if (t.realizedTps[0]) t.sl = entryPrice;
+          }
+
           t.tp = t.tps[0];
           stateChanged = true;
         }
@@ -885,10 +892,16 @@ function processTradeUpdateServerLogic(
     return { nextActive: null, closedTrade: closed, updatedStats: stats, loggedMsg };
   }
 
+  // Re-calculate Trailing Stop Loss Logic after TPs
+  let newSlBound = trade.sl;
+  if (realizedTps[2] && trade.tps) newSlBound = trade.tps[1];      // TP3 hit -> SL to TP2
+  else if (realizedTps[1] && trade.tps) newSlBound = trade.tps[0]; // TP2 hit -> SL to TP1
+  else if (realizedTps[0]) newSlBound = entry;        // TP1 hit -> SL to BE
+
   // Otherwise, keep the active position alive but updated
   const nextActive = {
     ...trade,
-    sl: slBound,
+    sl: newSlBound,
     currentPrice,
     size: currentSize,
     realizedTps,
@@ -946,7 +959,7 @@ async function checkRealPriceExitsServer() {
           console.error("[RECONCILER] Error updating DB trade record:", err);
         }
       } else if (nextActive) {
-        const didPartialTp = JSON.stringify(nextActive.realizedTps) !== JSON.stringify(trade.realizedTps);
+        const didPartialTp = JSON.stringify(nextActive.realizedTps) !== JSON.stringify(trade.realizedTps) || nextActive.sl !== trade.sl;
         if (didPartialTp) {
           stateChanged = true;
           stats = updatedStats;
@@ -955,6 +968,19 @@ async function checkRealPriceExitsServer() {
             logs.unshift(`[${timestamp}] ${loggedMsg}`);
           }
           remaining.push(nextActive);
+          
+          try {
+            await TradeModel.findOneAndUpdate(
+              { id: nextActive.id },
+              {
+                sl: nextActive.sl,
+                realizedTps: nextActive.realizedTps,
+                updatedAt: new Date()
+              }
+            );
+          } catch (err) {
+            console.error("[RECONCILER] Error updating DB trade record for partial TP:", err);
+          }
         } else {
           remaining.push(trade);
         }
@@ -1285,8 +1311,11 @@ function startWebSocketScreener() {
     console.log("[WEBSOCKET SCREENER] Connection established on 1H Binance kline streams! Low latency monitoring active.");
     reconnectDelay = 2000;
     
-    // Subscribe to klines
-    const params = MAJOR_FUTURES.map(coin => `${coin.toLowerCase()}usdt@kline_1h`);
+    // Subscribe to klines and tickers
+    const params = [
+      ...MAJOR_FUTURES.map(coin => `${coin.toLowerCase()}usdt@kline_1h`),
+      ...MAJOR_FUTURES.map(coin => `${coin.toLowerCase()}usdt@ticker`)
+    ];
     ws.send(JSON.stringify({
       method: "SUBSCRIBE",
       params,
@@ -1304,7 +1333,12 @@ function startWebSocketScreener() {
   ws.on("message", (raw) => {
     try {
       const payload = JSON.parse(raw.toString());
-      if (payload.e === "kline" && payload.k) {
+      if (payload.e === "24hrTicker") {
+        const symbol = payload.s; // e.g., "BTCUSDT"
+        const coin = symbol.toUpperCase().replace("USDT", "");
+        const currentClose = parseFloat(payload.c);
+        globalLivePrices[coin] = currentClose;
+      } else if (payload.e === "kline" && payload.k) {
         const symbol = payload.s; // e.g., "BTCUSDT"
         const coin = symbol.toUpperCase().replace("USDT", "");
         const k = payload.k;
@@ -1573,17 +1607,17 @@ async function runMarketScan() {
     let triggeredSignals = 0;
     
     // We only process the top 15 to avoid API limits on free tiers, or run concurrently
-    // Using MAJOR_FUTURES, processing all in parallel
-    const processPromises = MAJOR_FUTURES.map(async (coin) => {
+    // Using MAJOR_FUTURES, processing all sequentially to prevent DB race conditions
+    for (const coin of MAJOR_FUTURES) {
       try {
         const symbol = `${coin.toUpperCase()}USDT`;
         const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
           signal: AbortSignal.timeout(8000)
         });
-        if (!r.ok) return;
+        if (!r.ok) continue;
 
         const data = await r.json();
-        if (!Array.isArray(data)) return;
+        if (!Array.isArray(data)) continue;
         const candles = data.map(c => ({
           time: parseInt(c[0]),
           open: parseFloat(c[1]),
@@ -1593,7 +1627,7 @@ async function runMarketScan() {
           volume: parseFloat(c[5])
         }));
 
-        if (candles.length < 50) return;
+        if (candles.length < 50) continue;
 
         // Run technical analysis
         const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
@@ -1822,9 +1856,8 @@ async function runMarketScan() {
           }
         }
       } catch(e) {}
-    });
+    }
 
-    await Promise.all(processPromises);
     console.log(`[CRON] Background market scan complete. Triggered ${triggeredSignals} valid signals.`);
     return triggeredSignals;
   } catch(e) {

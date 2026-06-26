@@ -480,7 +480,7 @@ export default function App() {
       const hitTarget = isLong ? currentPrice >= targetPrice : currentPrice <= targetPrice;
       
       // Strict mathematical constraint: require price to genuinely advance into profit
-      const isValidMove = isLong ? currentPrice > entry * 1.001 : currentPrice < entry * 0.999;
+      const isValidMove = isLong ? currentPrice > entry * 1.0005 : currentPrice < entry * 0.9995;
 
       if (hitTarget && isValidMove) {
         realizedTps[i] = true;
@@ -562,10 +562,16 @@ export default function App() {
       return { nextActive: null, closedTrade: closed };
     }
 
+    // Re-calculate Trailing Stop Loss Logic after TPs
+    let newSlBound = trade.sl;
+    if (realizedTps[2]) newSlBound = trade.tps[1];      // TP3 hit -> SL to TP2
+    else if (realizedTps[1]) newSlBound = trade.tps[0]; // TP2 hit -> SL to TP1
+    else if (realizedTps[0]) newSlBound = entry;        // TP1 hit -> SL to BE
+
     // Otherwise, keep the active position alive but updated
     const nextActive: ActiveTrade = {
       ...trade,
-      sl: slBound,
+      sl: newSlBound,
       currentPrice,
       size: currentSize,
       realizedTps,
