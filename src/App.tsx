@@ -770,21 +770,30 @@ export default function App() {
       writeLog("SYNCING MARKET DATA: Fetching 300h candle histories directly from Binance Futures API...");
       const initialCandles: Record<string, any[]> = {};
       
-      await Promise.all(
-        MAJOR_FUTURES.map(async (coin) => {
-          try {
-            const res = await fetch(`/api/binance/metrics/${coin}`);
-            const data = await res.json();
-            if (data && data.success && data.candles && data.candles.length > 0) {
-              initialCandles[coin] = data.candles;
-            } else {
-              writeLog(`[ERROR] Failed to fetch historical data for ${coin}USDT from Binance API`);
+      // Process in chunks to avoid overwhelming the Binance API
+      const chunkSize = 4;
+      for (let i = 0; i < MAJOR_FUTURES.length; i += chunkSize) {
+        const chunk = MAJOR_FUTURES.slice(i, i + chunkSize);
+        await Promise.all(
+          chunk.map(async (coin) => {
+            try {
+              const res = await fetch(`/api/binance/metrics/${coin}`);
+              const data = await res.json();
+              if (data && data.success && data.candles && data.candles.length > 0) {
+                initialCandles[coin] = data.candles;
+              } else {
+                writeLog(`[ERROR] Failed to fetch historical data for ${coin}USDT from Binance API`);
+              }
+            } catch (err) {
+               writeLog(`[ERROR] Failed to fetch historical data for ${coin}USDT from Binance API`);
             }
-          } catch (err) {
-             writeLog(`[ERROR] Failed to fetch historical data for ${coin}USDT from Binance API`);
-          }
-        })
-      );
+          })
+        );
+        // Sleep for 1000ms between chunks
+        if (i + chunkSize < MAJOR_FUTURES.length) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
 
       setCoinsCandles(initialCandles);
       writeLog(`SUCCESS: Seeded 300h real-market history buffers for ${Object.keys(initialCandles).length} primary pairs.`);

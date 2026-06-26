@@ -13,11 +13,19 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
   const { id, symbol, direction, entry, tps, sl, currentPrice } = trade;
   const isLong = direction === 'LONG';
   
-  // High-fidelity progress mapping
-  const slBound = sl;
+  // Fetch real theoretical allocations
+  const config = COIN_CONFIGS[symbol] || { alloc: [40, 30, 20, 10], sl: 2.0 };
+  const allocs = config.alloc;
+
+  // High-fidelity progress mapping anchored to the original initial trade bounds
+  const initialSl = isLong 
+    ? entry * (1 - (config.sl ?? 2.0) / 100)
+    : entry * (1 + (config.sl ?? 2.0) / 100);
+
+  const slBound = initialSl;
   const tpBound = tps ? tps[3] : trade.tp; // Use TP4 as target bounds
   
-  // Calculate percentage progress between SL (0%) and TP4 (100%)
+  // Calculate percentage progress between initial SL (0%) and TP4 (100%)
   const percentage = ((currentPrice - slBound) / (tpBound - slBound)) * 100;
   const safePercentage = Math.max(0, Math.min(100, percentage));
   
@@ -27,10 +35,6 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
 
   const currentPnlValue = (trade.size * currentPnlPercent) / 100;
   const isProfit = currentPnlPercent >= 0;
-
-  // Fetch real theoretical allocations
-  const config = COIN_CONFIGS[symbol] || { alloc: [40, 30, 20, 10] };
-  const allocs = config.alloc;
 
   // Determine reached status for each target
   const checkTargetReached = (val: number) => {
@@ -49,7 +53,7 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
     { 
       label: 'SL', 
       price: sl, 
-      percent: 0, 
+      percent: getPercentageOf(sl), 
       position: 'below' as const, 
       color: 'text-rose-500 font-extrabold', 
       dotColor: 'bg-rose-500 shadow-[0_0_4px_#ef4444]' 
@@ -79,26 +83,31 @@ export function ActiveTradeCard({ trade }: ActiveTradeCardProps) {
   ].filter(p => p.percent >= -0.1 && p.percent <= 100.1);
 
   const points = [];
-  const atZero = rawPoints.filter(p => Math.abs(p.percent) < 0.1);
-  const others = rawPoints.filter(p => p.percent >= 0.1);
-
-  if (atZero.length > 0) {
-    const slPoint = atZero.find(p => p.label.startsWith('SL'));
-    if (slPoint) {
-      const otherLabels = atZero.filter(p => !p.label.startsWith('SL')).map(p => p.label);
-      let newLabel = 'SL';
-      if (otherLabels.includes('TP3')) newLabel = 'SL (TP3)';
-      else if (otherLabels.includes('TP2')) newLabel = 'SL (TP2)';
-      else if (otherLabels.includes('TP1')) newLabel = 'SL (TP1)';
-      else if (otherLabels.includes('ENT')) newLabel = 'SL (BE)';
-      
-      points.push({ ...slPoint, label: newLabel });
-    } else {
-      points.push(atZero[atZero.length - 1]);
-    }
-  }
   
-  points.push(...others);
+  // Look for any overlaps with SL
+  const slPoint = rawPoints.find(p => p.label === 'SL');
+  const otherPoints = rawPoints.filter(p => p.label !== 'SL');
+
+  if (slPoint) {
+    // Find if SL is exactly equal to another point's price
+    const overlap = otherPoints.find(p => Math.abs(p.price - slPoint.price) < (entry * 0.0001));
+    if (overlap) {
+      let newLabel = 'SL';
+      if (overlap.label === 'TP3') newLabel = 'SL (TP3)';
+      else if (overlap.label === 'TP2') newLabel = 'SL (TP2)';
+      else if (overlap.label === 'TP1') newLabel = 'SL (TP1)';
+      else if (overlap.label === 'ENT') newLabel = 'SL (BE)';
+      
+      points.push({ ...overlap, label: newLabel, color: 'text-rose-400 font-extrabold', dotColor: 'bg-rose-400 shadow-[0_0_6px_#fb7185] z-30' });
+      // add the rest of other points except the overlapped one
+      points.push(...otherPoints.filter(p => p !== overlap));
+    } else {
+      points.push(slPoint);
+      points.push(...otherPoints);
+    }
+  } else {
+    points.push(...otherPoints);
+  }
 
   return (
     <motion.div 

@@ -384,7 +384,10 @@ async function getOrFetchCandles(coin: string): Promise<any[] | null> {
   try {
     const symbol = `${coin.toUpperCase()}USDT`;
     const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      }
     });
     if (!r.ok) return null;
     const data = await r.json();
@@ -1011,7 +1014,10 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
   try {
     const symbol = `${coin.toUpperCase()}USDT`;
     const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      }
     });
     if (!r.ok) return;
 
@@ -1609,10 +1615,14 @@ async function runMarketScan() {
     // We only process the top 15 to avoid API limits on free tiers, or run concurrently
     // Using MAJOR_FUTURES, processing all sequentially to prevent DB race conditions
     for (const coin of MAJOR_FUTURES) {
+      await new Promise(resolve => setTimeout(resolve, 200)); // sleep to prevent any IP flagging
       try {
         const symbol = `${coin.toUpperCase()}USDT`;
         const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
-          signal: AbortSignal.timeout(8000)
+          signal: AbortSignal.timeout(10000),
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+          }
         });
         if (!r.ok) continue;
 
@@ -1953,7 +1963,10 @@ app.get("/api/binance/prices", async (req, res) => {
     }
 
     const response = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", {
-      signal: AbortSignal.timeout(4000)
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      }
     });
     
     if (!response.ok) {
@@ -2003,7 +2016,10 @@ app.get("/api/binance/metrics/:coin", async (req, res) => {
     const symbol = `${coin}USDT`;
 
     const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      }
     });
 
     if (!r.ok) {
