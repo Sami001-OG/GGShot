@@ -432,6 +432,28 @@ if (mongoUri) {
   }, 100);
 }
 
+// Wrapper for fetching klines to fallback to spot API if IP banned by futures API
+async function fetchBinanceKlines(symbol: string, interval = "1h", limit = 1000) {
+  let r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`, {
+    signal: AbortSignal.timeout(10000),
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+  });
+  
+  if (r.status === 418 || r.status === 429) {
+    console.warn(`[BINANCE API] Futures IP Banned or Rate Limited (Status ${r.status}). Falling back to Spot API for ${symbol}...`);
+    r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`, {
+      signal: AbortSignal.timeout(10000),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+      }
+    });
+  }
+  
+  return r;
+}
+
 const MAJOR_FUTURES = [
   'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'PEPE', 'WIF', 'SUI',
   'APT', 'ARB', 'OP', 'TIA', 'NOT', 'LTC', 'LINK', 'DOT', 'NEAR', 'AVAX'
@@ -488,12 +510,7 @@ async function getOrFetchCandles(coin: string): Promise<any[] | null> {
   
   try {
     const symbol = `${coin.toUpperCase()}USDT`;
-    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
-      signal: AbortSignal.timeout(10000),
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
+    const r = await fetchBinanceKlines(symbol, "1h", 1000);
     if (!r.ok) return null;
     const data = await r.json();
     if (!Array.isArray(data)) return null;
@@ -735,8 +752,9 @@ async function updateCoinCandleCacheAndCheck(coin: string, k: any) {
       entryPrice * (1 - p4 / 100)
     ];
   }
-
-  const baseSize = 10000 * 0.02 * config.risk * 3;
+  
+  // Professional position sizing: 2% of total fund
+  const baseSize = stats.balance * 0.02;
   const now = new Date();
   const dd = String(now.getUTCDate()).padStart(2, '0');
   const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
@@ -1118,12 +1136,7 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
   
   try {
     const symbol = `${coin.toUpperCase()}USDT`;
-    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
-      signal: AbortSignal.timeout(10000),
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
+    const r = await fetchBinanceKlines(symbol, "1h", 1000);
     if (!r.ok) return;
 
     const data = await r.json();
@@ -1337,8 +1350,9 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
         entryPrice * (1 - p4 / 100)
       ];
     }
-
-    const baseSize = 10000 * 0.02 * config.risk * 3;
+    
+    // Professional position sizing: 2% of total fund
+    const baseSize = stats.balance * 0.02;
     const now = new Date();
     const dd = String(now.getUTCDate()).padStart(2, '0');
     const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
@@ -1766,17 +1780,26 @@ async function runMarketScan() {
     // Fetch all active USDT perpetual symbols from Binance Futures dynamically
     let symbolsToScan: string[] = [...MAJOR_FUTURES];
     try {
-      const exchangeRes = await fetch("https://fapi.binance.com/fapi/v1/exchangeInfo", {
+      let exchangeRes = await fetch("https://fapi.binance.com/fapi/v1/exchangeInfo", {
         signal: AbortSignal.timeout(5000),
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
       });
+      if (exchangeRes.status === 418 || exchangeRes.status === 429) {
+        exchangeRes = await fetch("https://api.binance.com/api/v3/exchangeInfo", {
+          signal: AbortSignal.timeout(5000),
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+          }
+        });
+      }
       if (exchangeRes.ok) {
         const exchangeInfo = await exchangeRes.json() as any;
         if (exchangeInfo && Array.isArray(exchangeInfo.symbols)) {
+          // Spot API doesn't have contractType, so we filter by quoteAsset
           const dynamicSymbols = exchangeInfo.symbols
-            .filter((s: any) => s.contractType === "PERPETUAL" && s.quoteAsset === "USDT" && s.status === "TRADING")
+            .filter((s: any) => (s.contractType === "PERPETUAL" || s.contractType === undefined) && s.quoteAsset === "USDT" && s.status === "TRADING")
             .map((s: any) => s.baseAsset);
           if (dynamicSymbols.length > 0) {
             // Combine with MAJOR_FUTURES and ensure uniqueness
@@ -1800,12 +1823,7 @@ async function runMarketScan() {
         const coin = symbolsToScan[currentIndex++];
         try {
           const symbol = `${coin.toUpperCase()}USDT`;
-          const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
-            signal: AbortSignal.timeout(10000),
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-          });
+          const r = await fetchBinanceKlines(symbol, "1h", 1000);
           if (!r.ok) continue;
           const data = await r.json();
           if (!Array.isArray(data)) continue;
@@ -2022,7 +2040,8 @@ async function runMarketScan() {
             ];
           }
 
-          const baseSize = 10000 * 0.02 * config.risk * 3;
+          // Professional position sizing: 2% of total fund
+          const baseSize = stats.balance * 0.02;
           const now = new Date();
           const dateKey = `${String(now.getUTCDate()).padStart(2, '0')}${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
           const count = await getNextTradeCount(dateKey);
@@ -2155,12 +2174,21 @@ app.get("/api/binance/prices", async (req, res) => {
       });
     }
 
-    const response = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", {
+    let response = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", {
       signal: AbortSignal.timeout(10000),
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
       }
     });
+    
+    if (response.status === 418 || response.status === 429) {
+      response = await fetch("https://api.binance.com/api/v3/ticker/price", {
+        signal: AbortSignal.timeout(10000),
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+      });
+    }
     
     if (!response.ok) {
       throw new Error(`Binance API error: ${response.statusText}`);
@@ -2208,12 +2236,7 @@ app.get("/api/binance/metrics/:coin", async (req, res) => {
     const coin = (req.params.coin || "BTC").toUpperCase();
     const symbol = `${coin}USDT`;
 
-    const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
-      signal: AbortSignal.timeout(10000),
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
+    const r = await fetchBinanceKlines(symbol, "1h", 1000);
 
     if (!r.ok) {
       throw new Error(`Failed to fetch candles: ${r.statusText}`);

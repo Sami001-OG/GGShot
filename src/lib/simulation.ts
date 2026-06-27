@@ -174,8 +174,8 @@ export function spawnTradeOfCondition(
   // Final TP4 target boundary
   const tp = tps[0]; // TP1 target
 
-  // Professional position sizing: 2% of simulated 10k portfolio adjusted by coin risk * 3x leverage
-  const baseSize = 10000 * 0.02 * config.risk * 3;
+  // Professional position sizing: 2% of simulated 10k portfolio
+  const baseSize = 10000 * 0.02;
 
   return {
     id: `${(idCounter++).toString().padStart(3, '0')}`,
