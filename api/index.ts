@@ -17,6 +17,20 @@ if (mongoUri && mongoUri.includes("123sami@gg-shot")) {
   mongoUri = "mongodb+srv://Sami:sami%40123sami@gg-shot.ybpg66p.mongodb.net/?appName=GG-Shot";
 }
 
+// Strict DB Operation Timeout Guard Helper to prevent slow or hanging MongoDB queries
+async function withDbTimeout<T>(promise: Promise<T>, fallback: T, timeoutMs = 3500): Promise<T> {
+  let timeoutId: any;
+  const timeoutPromise = new Promise<T>((resolve) => {
+    timeoutId = setTimeout(() => {
+      console.warn(`[DB TIMEOUT] Query exceeded ${timeoutMs}ms limit. Falling back.`);
+      resolve(fallback);
+    }, timeoutMs);
+  });
+  const result = await Promise.race([promise, timeoutPromise]);
+  clearTimeout(timeoutId);
+  return result;
+}
+
 // Fallback In-Memory DB
 let memoryDbState: any = {
   id: "main",
@@ -101,6 +115,76 @@ async function getNextTradeCount(dateKey: string): Promise<number> {
   return next;
 }
 
+function calculateClosedTradeCorrectPnl(t: any, config: any) {
+  const entryPrice = t.entry || t.entryPrice;
+  const exitPrice = t.exitPrice || entryPrice;
+  const direction = t.direction;
+  const isLong = direction === 'LONG';
+  
+  if (!entryPrice || !direction) return { pnlPercent: 0, pnl: 0 };
+
+  const p1 = config.tp[0];
+  const p2 = config.tp[1];
+  const p3 = config.tp[2];
+  const p4 = config.tp[3];
+  
+  let tp1Price: number;
+  let tp2Price: number;
+  let tp3Price: number;
+  let tp4Price: number;
+
+  if (isLong) {
+    tp1Price = entryPrice * (1 + p1 / 100);
+    tp2Price = entryPrice * (1 + p2 / 100);
+    tp3Price = entryPrice * (1 + p3 / 100);
+    tp4Price = entryPrice * (1 + p4 / 100);
+  } else {
+    tp1Price = entryPrice * (1 - p1 / 100);
+    tp2Price = entryPrice * (1 - p2 / 100);
+    tp3Price = entryPrice * (1 - p3 / 100);
+    tp4Price = entryPrice * (1 - p4 / 100);
+  }
+
+  let realizedTps = [...(t.realizedTps || [false, false, false, false])];
+  
+  // If realizedTps array not defined/empty, and status is WIN, infer TP1 was hit
+  if ((!t.realizedTps || t.realizedTps.every((v: boolean) => !v)) && t.status === 'WIN') {
+    realizedTps = [true, false, false, false];
+    if (isLong) {
+      if (exitPrice >= tp3Price) realizedTps = [true, true, true, false];
+      else if (exitPrice >= tp2Price) realizedTps = [true, true, false, false];
+      else if (exitPrice >= tp1Price) realizedTps = [true, false, false, false];
+    } else {
+      if (exitPrice <= tp3Price) realizedTps = [true, true, true, false];
+      else if (exitPrice <= tp2Price) realizedTps = [true, true, false, false];
+      else if (exitPrice <= tp1Price) realizedTps = [true, false, false, false];
+    }
+  }
+
+  const alloc = config.alloc || [40, 30, 20, 10];
+  const initialSize = t.initialSize || t.size || 100;
+  
+  let partialPnlRealized = 0;
+  let remainingSize = initialSize;
+
+  for (let i = 0; i < 4; i++) {
+    if (realizedTps[i]) {
+      const partShare = alloc[i] / 100;
+      const partSize = initialSize * partShare;
+      const targetPrice = i === 0 ? tp1Price : (i === 1 ? tp2Price : (i === 2 ? tp3Price : tp4Price));
+      const partPnl = (partSize * (isLong ? (targetPrice - entryPrice) : (entryPrice - targetPrice))) / entryPrice;
+      partialPnlRealized += partPnl;
+      remainingSize = Math.max(0, remainingSize - partSize);
+    }
+  }
+
+  const remainingPnl = (remainingSize * (isLong ? (exitPrice - entryPrice) : (entryPrice - exitPrice))) / entryPrice;
+  const totalPnl = partialPnlRealized + remainingPnl;
+  const pnlPercent = (totalPnl / initialSize) * 100;
+
+  return { pnlPercent, pnl: totalPnl };
+}
+
 async function healExistingTradesInDatabase() {
   try {
     console.log("[DATABASE HEALER] Initiating healing of existing trade records to fix calculation formula...");
@@ -155,12 +239,18 @@ async function healExistingTradesInDatabase() {
       }
       
       if (doc.status !== "OPEN") {
-        const exitPrice = doc.exitPrice || correctTps[3];
-        const correctPnlPercent = direction === 'LONG'
-          ? ((exitPrice - entryPrice) / entryPrice) * 100
-          : ((entryPrice - exitPrice) / entryPrice) * 100;
-          
-        doc.pnlPercent = correctPnlPercent;
+        let finalPnlPercent = doc.pnlPercent;
+        if (finalPnlPercent === undefined || finalPnlPercent === null || finalPnlPercent === 0) {
+          const calcResult = calculateClosedTradeCorrectPnl({
+            entry: entryPrice,
+            exitPrice: doc.exitPrice || entryPrice,
+            direction,
+            status: doc.status,
+            realizedTps: (doc as any).realizedTps
+          }, config);
+          finalPnlPercent = calcResult.pnlPercent;
+        }
+        doc.pnlPercent = finalPnlPercent;
       }
       
       await doc.save();
@@ -247,13 +337,19 @@ async function healExistingTradesInDatabase() {
           }
           t.tp = t.tps[0];
           
-          const exitPrice = t.exitPrice || t.tps[3];
-          const correctPnlPercent = direction === 'LONG'
-            ? ((exitPrice - entryPrice) / entryPrice) * 100
-            : ((entryPrice - exitPrice) / entryPrice) * 100;
-            
-          t.pnlPercent = correctPnlPercent;
-          t.pnl = (t.initialSize || t.size) * (correctPnlPercent / 100);
+          let finalPnlPercent = t.pnlPercent;
+          let finalPnl = t.pnl;
+          
+          if (finalPnlPercent === undefined || finalPnlPercent === null || finalPnlPercent === 0) {
+            const calcResult = calculateClosedTradeCorrectPnl(t, config);
+            finalPnlPercent = calcResult.pnlPercent;
+            finalPnl = calcResult.pnl;
+          } else {
+            finalPnl = (t.initialSize || t.size) * (finalPnlPercent / 100);
+          }
+          
+          t.pnlPercent = finalPnlPercent;
+          t.pnl = finalPnl;
           stateChanged = true;
         }
 
@@ -264,7 +360,7 @@ async function healExistingTradesInDatabase() {
         for (const t of closedTrades) {
           const tradePnl = t.pnl || 0;
           calculatedTotalPnl += tradePnl;
-          if (tradePnl > 0) {
+          if (tradePnl > 0 || t.status === "WIN") {
             calculatedWon++;
             t.status = "WIN";
           } else {
@@ -295,8 +391,12 @@ async function healExistingTradesInDatabase() {
 }
 
 if (mongoUri) {
-  // Original DB setup
-  const client = new MongoClient(mongoUri);
+  // Original DB setup with strict timeouts to prevent query hangs or DNS lookup blockings
+  const client = new MongoClient(mongoUri, {
+    connectTimeoutMS: 5000,
+    socketTimeoutMS: 5000,
+    serverSelectionTimeoutMS: 5000
+  });
   client.connect().then(() => {
     db = client.db("Srade");
     console.log("Connected to MongoDB successfully via standard driver.");
@@ -312,8 +412,13 @@ if (mongoUri) {
     startWebSocketScreener();
   });
 
-  // Mongoose setup
-  mongoose.connect(mongoUri, { dbName: "Srade" }).then(() => {
+  // Mongoose setup with strict timeouts
+  mongoose.connect(mongoUri, { 
+    dbName: "Srade",
+    connectTimeoutMS: 5000,
+    socketTimeoutMS: 5000,
+    serverSelectionTimeoutMS: 5000
+  }).then(() => {
     console.log("Connected to Mongoose successfully for Trades tracking.");
     healExistingTradesInDatabase().catch(e => console.error("[DATABASE HEALER ERROR]:", e.message));
   }).catch(err => {
@@ -1533,23 +1638,35 @@ app.get("/api/admin/heal", async (req, res) => {
 });
 
 app.get("/api/db/state", async (req, res) => {
-  if (!db) return res.json({ error: "Database not connected" });
+  if (!db) {
+    return res.json({ activeTrades: [], closedTrades: [], stats: { balance: 10000, won: 0, lost: 0, totalPnl: 0 }, logs: ["Database not initialized, running in memory fallback"] });
+  }
   try {
-    const stateRecord = await db.collection("system_state").findOne({ id: "main" });
+    const stateRecord = await withDbTimeout(
+      db.collection("system_state").findOne({ id: "main" }),
+      null,
+      3500
+    );
     if (stateRecord) {
       res.json(stateRecord);
     } else {
       res.json({ activeTrades: [], closedTrades: [], stats: { balance: 10000, won: 0, lost: 0, totalPnl: 0 }, logs: [] });
     }
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch state from DB" });
+    console.error("[STATE GET ERROR] Fallback to default state:", error);
+    res.json({ activeTrades: [], closedTrades: [], stats: { balance: 10000, won: 0, lost: 0, totalPnl: 0 }, logs: [] });
   }
 });
 
 app.post("/api/db/state", async (req, res) => {
-  if (!db) return res.json({ error: "Database not connected" });
+  if (!db) {
+    return res.json({ success: false, error: "Database not initialized" });
+  }
   try {
     const { 
+      activeTrades,
+      closedTrades,
+      stats,
       logs,
       filterAdx,
       filterMtf,
@@ -1559,18 +1676,28 @@ app.post("/api/db/state", async (req, res) => {
       filterLiquidity
     } = req.body;
 
-    const currentState = await db.collection("system_state").findOne({ id: "main" });
+    const currentState = await withDbTimeout(
+      db.collection("system_state").findOne({ id: "main" }),
+      null,
+      3500
+    );
     let mergedLogs = logs || [];
     
-    let activeTrades = [];
-    let closedTrades = [];
-    let stats = { balance: 10000, won: 0, lost: 0, totalPnl: 0 };
+    let activeTradesToSave = activeTrades;
+    let closedTradesToSave = closedTrades;
+    let statsToSave = stats;
+
+    if (activeTradesToSave === undefined) {
+      activeTradesToSave = currentState ? (currentState.activeTrades || []) : [];
+    }
+    if (closedTradesToSave === undefined) {
+      closedTradesToSave = currentState ? (currentState.closedTrades || []) : [];
+    }
+    if (statsToSave === undefined) {
+      statsToSave = currentState ? (currentState.stats || { balance: 10000, won: 0, lost: 0, totalPnl: 0 }) : { balance: 10000, won: 0, lost: 0, totalPnl: 0 };
+    }
 
     if (currentState) {
-      activeTrades = currentState.activeTrades || [];
-      closedTrades = currentState.closedTrades || [];
-      stats = currentState.stats || stats;
-
       if (currentState.logs) {
          const frontendLogsSet = new Set(logs || []);
          const unseenBackendLogs = currentState.logs.filter((l: string) => !frontendLogsSet.has(l));
@@ -1578,28 +1705,40 @@ app.post("/api/db/state", async (req, res) => {
       }
     }
 
-    await db.collection("system_state").updateOne(
-      { id: "main" },
-      { 
-        $set: { 
-          activeTrades, 
-          closedTrades, 
-          stats, 
-          logs: mergedLogs, 
-          filterAdx,
-          filterMtf,
-          filterEma,
-          filterVolume,
-          filterFunding,
-          filterLiquidity,
-          updatedAt: new Date() 
-        } 
-      },
-      { upsert: true }
+    const filterAdxBool = typeof filterAdx === "boolean" ? filterAdx : (currentState && typeof currentState.filterAdx === "boolean" ? currentState.filterAdx : true);
+    const filterMtfBool = typeof filterMtf === "boolean" ? filterMtf : (currentState && typeof currentState.filterMtf === "boolean" ? currentState.filterMtf : true);
+    const filterEmaBool = typeof filterEma === "boolean" ? filterEma : (currentState && typeof currentState.filterEma === "boolean" ? currentState.filterEma : true);
+    const filterVolumeBool = typeof filterVolume === "boolean" ? filterVolume : (currentState && typeof currentState.filterVolume === "boolean" ? currentState.filterVolume : true);
+    const filterFundingBool = typeof filterFunding === "boolean" ? filterFunding : (currentState && typeof currentState.filterFunding === "boolean" ? currentState.filterFunding : true);
+    const filterLiquidityBool = typeof filterLiquidity === "boolean" ? filterLiquidity : (currentState && typeof currentState.filterLiquidity === "boolean" ? currentState.filterLiquidity : true);
+
+    await withDbTimeout(
+      db.collection("system_state").updateOne(
+        { id: "main" },
+        { 
+          $set: { 
+            activeTrades: activeTradesToSave, 
+            closedTrades: closedTradesToSave, 
+            stats: statsToSave, 
+            logs: mergedLogs, 
+            filterAdx: filterAdxBool,
+            filterMtf: filterMtfBool,
+            filterEma: filterEmaBool,
+            filterVolume: filterVolumeBool,
+            filterFunding: filterFundingBool,
+            filterLiquidity: filterLiquidityBool,
+            updatedAt: new Date() 
+          } 
+        },
+        { upsert: true }
+      ),
+      null,
+      3500
     );
     res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to save state to DB" });
+  } catch (error: any) {
+    console.error("[STATE POST ERROR] Failed to save state:", error);
+    res.json({ success: false, error: error.message || "Failed to save state" });
   }
 });
 
@@ -1612,261 +1751,315 @@ async function runMarketScan() {
   try {
     let triggeredSignals = 0;
     
-    // We only process the top 15 to avoid API limits on free tiers, or run concurrently
-    // Using MAJOR_FUTURES, processing all sequentially to prevent DB race conditions
-    for (const coin of MAJOR_FUTURES) {
-      await new Promise(resolve => setTimeout(resolve, 200)); // sleep to prevent any IP flagging
-      try {
-        const symbol = `${coin.toUpperCase()}USDT`;
-        const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
-          signal: AbortSignal.timeout(10000),
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    // Load system state ONCE at the start to prevent race conditions and excessive DB reads
+    const state = await getSystemState();
+    if (!state) {
+      console.error("[CRON] Failed to load system state. Scanning aborted.");
+      return 0;
+    }
+
+    let activeTrades = [...(state.activeTrades || [])];
+    let closedTrades = [...(state.closedTrades || [])];
+    let stats = state.stats || { balance: 10000, won: 0, lost: 0, totalPnl: 0 };
+    let logs = state.logs || [];
+
+    // Fetch all active USDT perpetual symbols from Binance Futures dynamically
+    let symbolsToScan: string[] = [...MAJOR_FUTURES];
+    try {
+      const exchangeRes = await fetch("https://fapi.binance.com/fapi/v1/exchangeInfo", {
+        signal: AbortSignal.timeout(5000),
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+      });
+      if (exchangeRes.ok) {
+        const exchangeInfo = await exchangeRes.json() as any;
+        if (exchangeInfo && Array.isArray(exchangeInfo.symbols)) {
+          const dynamicSymbols = exchangeInfo.symbols
+            .filter((s: any) => s.contractType === "PERPETUAL" && s.quoteAsset === "USDT" && s.status === "TRADING")
+            .map((s: any) => s.baseAsset);
+          if (dynamicSymbols.length > 0) {
+            // Combine with MAJOR_FUTURES and ensure uniqueness
+            const uniqueSet = new Set([...MAJOR_FUTURES, ...dynamicSymbols]);
+            symbolsToScan = Array.from(uniqueSet);
           }
-        });
-        if (!r.ok) continue;
+        }
+      }
+    } catch (err: any) {
+      console.warn("[CRON] Dynamic symbol lookup failed, falling back to static list. Error:", err.message);
+    }
 
-        const data = await r.json();
-        if (!Array.isArray(data)) continue;
-        const candles = data.map(c => ({
-          time: parseInt(c[0]),
-          open: parseFloat(c[1]),
-          high: parseFloat(c[2]),
-          low: parseFloat(c[3]),
-          close: parseFloat(c[4]),
-          volume: parseFloat(c[5])
-        }));
+    console.log(`[CRON] Initiating parallel scan of all ${symbolsToScan.length} active symbols...`);
 
-        if (candles.length < 50) continue;
+    const CONCURRENCY_LIMIT = 40;
+    const results: Array<{ coin: string; candles: any[]; config: any; resList: any }> = [];
+    let currentIndex = 0;
 
-        // Run technical analysis
-        const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
-        const resList = calculateSrade(candles, config.bbPeriod, config.bbDev, coin);
-        
-        const volumes = candles.map(c => c.volume);
-        for (let offset = 2; offset <= 3; offset++) {
-          const targetIdx = candles.length - offset;
-          if (targetIdx < 0) continue;
-          
-          const candleTime = candles[targetIdx].time;
-          const processedKey = `${coin}-${candleTime}`;
-          if (processedClosedKlines.has(processedKey)) continue;
+    async function worker() {
+      while (currentIndex < symbolsToScan.length) {
+        const coin = symbolsToScan[currentIndex++];
+        try {
+          const symbol = `${coin.toUpperCase()}USDT`;
+          const r = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=1000`, {
+            signal: AbortSignal.timeout(10000),
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+          });
+          if (!r.ok) continue;
+          const data = await r.json();
+          if (!Array.isArray(data)) continue;
 
-          const signal = resList.signals[targetIdx];
-          const adxVal = resList.adx[targetIdx] ?? 0;
-          const ema200val = resList.ema200_4h[targetIdx] ?? candles[targetIdx].close;
+          const candles = data.map((c: any) => ({
+            time: parseInt(c[0]),
+            open: parseFloat(c[1]),
+            high: parseFloat(c[2]),
+            low: parseFloat(c[3]),
+            close: parseFloat(c[4]),
+            volume: parseFloat(c[5])
+          }));
+
+          if (candles.length < 50) continue;
+
+          // Cache candles in-memory
+          serverCoinsCandles[coin] = candles;
+
+          const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
+          const resList = calculateSrade(candles, config.bbPeriod, config.bbDev, coin);
+
+          results.push({ coin, candles, config, resList });
+        } catch (e: any) {
+          // Silent catch for individual network dropouts to keep speed max
+        }
+      }
+    }
+
+    // Run parallel fetch pipeline
+    const workers = Array(CONCURRENCY_LIMIT).fill(null).map(() => worker());
+    await Promise.all(workers);
+
+    console.log(`[CRON] Fetched & analyzed indicators for ${results.length}/${symbolsToScan.length} symbols. Running strategy filters...`);
+
+    const filters = {
+      filterAdx: state.filterAdx !== undefined ? state.filterAdx : true,
+      filterMtf: state.filterMtf !== undefined ? state.filterMtf : true,
+      filterEma: state.filterEma !== undefined ? state.filterEma : true,
+      filterVolume: state.filterVolume !== undefined ? state.filterVolume : true,
+      filterFunding: state.filterFunding !== undefined ? state.filterFunding : true,
+      filterLiquidity: state.filterLiquidity !== undefined ? state.filterLiquidity : true,
+    };
+
+    // Sequential fast local analysis (no API delay, 0ms latency)
+    for (const { coin, candles, config, resList } of results) {
+      const volumes = candles.map(c => c.volume);
+      const ema200valList = resList.ema200_4h;
+
+      for (let offset = 2; offset <= 3; offset++) {
+        const targetIdx = candles.length - offset;
+        if (targetIdx < 0) continue;
+
+        const candleTime = candles[targetIdx].time;
+        const processedKey = `${coin}-${candleTime}`;
+        if (processedClosedKlines.has(processedKey)) continue;
+
+        const signal = resList.signals[targetIdx];
+        const adxVal = resList.adx[targetIdx] ?? 0;
+        const ema200val = ema200valList[targetIdx] ?? candles[targetIdx].close;
+
+        if (signal) {
+          const closePrice = candles[targetIdx].close;
+
+          // Volume Ratio Calculation
+          let volumeRatio = 1.0;
+          if (volumes.length >= 20) {
+            const lastVol = volumes[targetIdx] || 1.0;
+            const startSlice = Math.max(0, targetIdx - 20);
+            const prevVols = volumes.slice(startSlice, targetIdx);
+            if (prevVols.length > 0) {
+              const volSmaSum = prevVols.reduce((sum, v) => sum + (v || 0), 0) / prevVols.length;
+              volumeRatio = lastVol / (volSmaSum || 1);
+            }
+          }
+
+          const funding = getCoinFundingRate(coin, signal === 'LONG' ? 1 : -1);
+          const liquidity = getCoinBase24hVolume(coin);
+
+          // ADX gate
+          if (filters.filterAdx && adxVal <= 25) {
+            const log = `[CRON FILTER] ${coin} ${signal} at $${formatPrice(closePrice)} rejected: ADX sideways (${adxVal.toFixed(1)} <= 25)`;
+            logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+            await markKeyProcessed(processedKey);
+            continue;
+          }
+
+          // MTF gate
+          const candles4h = aggregateTo4Hour(candles.slice(0, targetIdx + 1));
+          const bbPeriod4h = Math.max(10, Math.round(config.bbPeriod / 4));
+          const iTrend4h = calculateITrendOnly(candles4h, bbPeriod4h, config.bbDev);
+          const mtfTrend = iTrend4h.length > 0 ? iTrend4h[iTrend4h.length - 1] : 0;
+          if (filters.filterMtf) {
+            if (signal === 'LONG' && mtfTrend !== 1) {
+              const log = `[CRON FILTER] ${coin} LONG at $${formatPrice(closePrice)} rejected: 4H trend direction bearish/neutral`;
+              logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+              await markKeyProcessed(processedKey);
+              continue;
+            }
+            if (signal === 'SHORT' && mtfTrend !== -1) {
+              const log = `[CRON FILTER] ${coin} SHORT at $${formatPrice(closePrice)} rejected: 4H trend direction bullish/neutral`;
+              logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+              await markKeyProcessed(processedKey);
+              continue;
+            }
+          }
+
+          // EMA gate
+          if (filters.filterEma) {
+            if (signal === 'LONG' && closePrice <= ema200val) {
+              const log = `[CRON FILTER] ${coin} LONG at $${formatPrice(closePrice)} rejected: price below 4H EMA 200 (${formatPrice(ema200val)})`;
+              logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+              await markKeyProcessed(processedKey);
+              continue;
+            }
+            if (signal === 'SHORT' && closePrice >= ema200val) {
+              const log = `[CRON FILTER] ${coin} SHORT at $${formatPrice(closePrice)} rejected: price above 4H EMA 200 (${formatPrice(ema200val)})`;
+              logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+              await markKeyProcessed(processedKey);
+              continue;
+            }
+          }
+
+          // Volume gate
+          if (filters.filterVolume && volumeRatio <= 1.5) {
+            const log = `[CRON FILTER] ${coin} ${signal} rejected: breakout volume ratio ${volumeRatio.toFixed(2)}x <= 1.5x`;
+            logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+            await markKeyProcessed(processedKey);
+            continue;
+          }
+
+          // Funding gate
+          if (filters.filterFunding) {
+            const fundingPct = funding * 100;
+            if (signal === 'LONG' && funding >= 0.05) {
+              const log = `[CRON FILTER] ${coin} LONG rejected: funding rate too high (${fundingPct.toFixed(4)}%)`;
+              logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+              await markKeyProcessed(processedKey);
+              continue;
+            }
+            if (signal === 'SHORT' && funding <= -0.05) {
+              const log = `[CRON FILTER] ${coin} SHORT rejected: funding rate too low (${fundingPct.toFixed(4)}%)`;
+              logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+              await markKeyProcessed(processedKey);
+              continue;
+            }
+          }
+
+          // Liquidity gate
+          if (filters.filterLiquidity && liquidity < 30000000) {
+            const log = `[CRON FILTER] ${coin} ${signal} rejected: Liquidity $${(liquidity/1000000).toFixed(1)}M < $30M limit`;
+            logs.unshift(`[${new Date().toLocaleTimeString()}] ${log}`);
+            await markKeyProcessed(processedKey);
+            continue;
+          }
+
+          // Reject duplicates on active symbols or handle Trend Reversal
+          const existingIndex = activeTrades.findIndex((t: any) => t.symbol === coin);
+          if (existingIndex !== -1) {
+            const existingTrade = activeTrades[existingIndex];
+            if (existingTrade.direction === signal) {
+              console.log(`[CRON SCANNER] Ignored duplicate ${signal} signal for ${coin}.`);
+              await markKeyProcessed(processedKey);
+              continue;
+            } else {
+              // Trend Reversal Exit: Exit counter trade first
+              const { closedTrade, updatedStats, loggedMsg } = processTradeUpdateServerLogic(existingTrade, closePrice, stats, true);
+              if (closedTrade) {
+                closedTrades.unshift(closedTrade);
+                stats = updatedStats;
+                if (loggedMsg) {
+                  logs.unshift(`[${new Date().toLocaleTimeString()}] ${loggedMsg}`);
+                }
+                try {
+                  await TradeModel.findOneAndUpdate(
+                    { tradeId: existingTrade.dbId },
+                    { 
+                      status: closedTrade.status, 
+                      exitPrice: closedTrade.exitPrice, 
+                      pnlPercent: closedTrade.pnlPercent, 
+                      updatedAt: new Date() 
+                    }
+                  );
+                } catch(err) {}
+              }
+              activeTrades = activeTrades.filter((t: any) => t.id !== existingTrade.id);
+            }
+          }
+
+          triggeredSignals++;
+          let tps: [number, number, number, number];
+          let sl: number;
+
+          const p1 = config.tp[0];
+          const p2 = config.tp[1];
+          const p3 = config.tp[2];
+          const p4 = config.tp[3];
+          const slPct = config.sl;
+
+          if (signal === 'LONG') {
+            sl = closePrice * (1 - slPct / 100);
+            tps = [
+              closePrice * (1 + p1 / 100),
+              closePrice * (1 + p2 / 100),
+              closePrice * (1 + p3 / 100),
+              closePrice * (1 + p4 / 100)
+            ];
+          } else {
+            sl = closePrice * (1 + slPct / 100);
+            tps = [
+              closePrice * (1 - p1 / 100),
+              closePrice * (1 - p2 / 100),
+              closePrice * (1 - p3 / 100),
+              closePrice * (1 - p4 / 100)
+            ];
+          }
+
+          const baseSize = 10000 * 0.02 * config.risk * 3;
+          const now = new Date();
+          const dateKey = `${String(now.getUTCDate()).padStart(2, '0')}${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+          const count = await getNextTradeCount(dateKey);
+          const tradeId = `${dateKey}${String(count).padStart(2, '0')}`;
+
+          const tradeRecord = new TradeModel({
+            tradeId, symbol: coin, direction: signal, entryPrice: closePrice, status: "OPEN", pnlPercent: 0
+          });
+          await tradeRecord.save();
+
+          const newTrade: any = {
+            id: Math.random().toString(36).substring(2, 7).toUpperCase(),
+            dbId: tradeId, symbol: coin, direction: signal, entry: closePrice, tp: tps[0], tps, sl, currentPrice: closePrice,
+            size: baseSize, risk: config.risk, realizedTps: [false, false, false, false], initialSize: baseSize, partialPnlRealized: 0
+          };
+
+          activeTrades.push(newTrade);
+          const successMsg = `>>> SYSTEM SCANNER TRIGGER: ${coin} ${signal} @ $${formatPrice(closePrice)} generated! Trade ${tradeId} recorded.`;
+          logs.unshift(`[${new Date().toLocaleTimeString()}] ${successMsg}`);
 
           await markKeyProcessed(processedKey);
 
-          if (signal) {
-            const state = await getSystemState();
-            if (!state) continue;
-
-            const filters = {
-              filterAdx: state.filterAdx !== undefined ? state.filterAdx : true,
-              filterMtf: state.filterMtf !== undefined ? state.filterMtf : true,
-              filterEma: state.filterEma !== undefined ? state.filterEma : true,
-              filterVolume: state.filterVolume !== undefined ? state.filterVolume : true,
-              filterFunding: state.filterFunding !== undefined ? state.filterFunding : true,
-              filterLiquidity: state.filterLiquidity !== undefined ? state.filterLiquidity : true,
-            };
-
-            const closePrice = candles[targetIdx].close;
-
-            // Volume Ratio Calculation
-            let volumeRatio = 1.0;
-            if (volumes.length >= 20) {
-              const lastVol = volumes[targetIdx] || 1.0;
-              const startSlice = Math.max(0, targetIdx - 20);
-              const prevVols = volumes.slice(startSlice, targetIdx);
-              if (prevVols.length > 0) {
-                const volSmaSum = prevVols.reduce((sum, v) => sum + (v || 0), 0) / prevVols.length;
-                volumeRatio = lastVol / (volSmaSum || 1);
-              }
-            }
-
-            const funding = getCoinFundingRate(coin, signal === 'LONG' ? 1 : -1);
-            const liquidity = getCoinBase24hVolume(coin);
-
-            // ADX gate
-            if (filters.filterAdx && adxVal <= 25) {
-              const log = `[CRON FILTER] ${coin} ${signal} at $${formatPrice(closePrice)} rejected: ADX sideways (${adxVal.toFixed(1)} <= 25)`;
-              state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
-              await saveSystemState(state);
-              continue;
-            }
-
-            // MTF gate
-            const candles4h = aggregateTo4Hour(candles.slice(0, targetIdx + 1));
-            const bbPeriod4h = Math.max(10, Math.round(config.bbPeriod / 4));
-            const iTrend4h = calculateITrendOnly(candles4h, bbPeriod4h, config.bbDev);
-            const mtfTrend = iTrend4h.length > 0 ? iTrend4h[iTrend4h.length - 1] : 0;
-            if (filters.filterMtf) {
-              if (signal === 'LONG' && mtfTrend !== 1) {
-                const log = `[CRON FILTER] ${coin} LONG at $${formatPrice(closePrice)} rejected: 4H trend direction bearish/neutral`;
-                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
-                await saveSystemState(state);
-                continue;
-              }
-              if (signal === 'SHORT' && mtfTrend !== -1) {
-                const log = `[CRON FILTER] ${coin} SHORT at $${formatPrice(closePrice)} rejected: 4H trend direction bullish/neutral`;
-                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
-                await saveSystemState(state);
-                continue;
-              }
-            }
-
-            // EMA gate
-            if (filters.filterEma) {
-              if (signal === 'LONG' && closePrice <= ema200val) {
-                const log = `[CRON FILTER] ${coin} LONG at $${formatPrice(closePrice)} rejected: price below 4H EMA 200 (${formatPrice(ema200val)})`;
-                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
-                await saveSystemState(state);
-                continue;
-              }
-              if (signal === 'SHORT' && closePrice >= ema200val) {
-                const log = `[CRON FILTER] ${coin} SHORT at $${formatPrice(closePrice)} rejected: price above 4H EMA 200 (${formatPrice(ema200val)})`;
-                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
-                await saveSystemState(state);
-                continue;
-              }
-            }
-
-            // Volume gate
-            if (filters.filterVolume && volumeRatio <= 1.5) {
-              const log = `[CRON FILTER] ${coin} ${signal} rejected: breakout volume ratio ${volumeRatio.toFixed(2)}x <= 1.5x`;
-              state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
-              await saveSystemState(state);
-              continue;
-            }
-
-            // Funding gate
-            if (filters.filterFunding) {
-              const fundingPct = funding * 100;
-              if (signal === 'LONG' && funding >= 0.05) {
-                const log = `[CRON FILTER] ${coin} LONG rejected: funding rate too high (${fundingPct.toFixed(4)}%)`;
-                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
-                await saveSystemState(state);
-                continue;
-              }
-              if (signal === 'SHORT' && funding <= -0.05) {
-                const log = `[CRON FILTER] ${coin} SHORT rejected: funding rate too low (${fundingPct.toFixed(4)}%)`;
-                state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
-                await saveSystemState(state);
-                continue;
-              }
-            }
-
-            // Liquidity gate
-            if (filters.filterLiquidity && liquidity < 30000000) {
-              const log = `[CRON FILTER] ${coin} ${signal} rejected: Liquidity $${(liquidity/1000000).toFixed(1)}M < $30M limit`;
-              state.logs = [`[${new Date().toLocaleTimeString()}] ${log}`, ...(state.logs || [])].slice(0, 40);
-              await saveSystemState(state);
-              continue;
-            }
-
-            // Reject duplicates on active symbols or handle Trend Reversal
-            let activeTrades = [...(state.activeTrades || [])];
-            const closedTrades = [...(state.closedTrades || [])];
-            let stats = state.stats || { balance: 10000, won: 0, lost: 0, totalPnl: 0 };
-            let logs = state.logs || [];
-
-            const existingIndex = activeTrades.findIndex((t: any) => t.symbol === coin);
-            if (existingIndex !== -1) {
-              const existingTrade = activeTrades[existingIndex];
-              if (existingTrade.direction === signal) {
-                console.log(`[CRON SCANNER] Ignored duplicate ${signal} signal for ${coin}.`);
-                continue;
-              } else {
-                // Trend Reversal Exit: Exit counter trade first
-                const { closedTrade, updatedStats, loggedMsg } = processTradeUpdateServerLogic(existingTrade, closePrice, stats, true);
-                if (closedTrade) {
-                  closedTrades.unshift(closedTrade);
-                  stats = updatedStats;
-                  if (loggedMsg) {
-                    logs.unshift(`[${new Date().toLocaleTimeString()}] ${loggedMsg}`);
-                  }
-                  try {
-                    await TradeModel.findOneAndUpdate(
-                      { tradeId: existingTrade.dbId },
-                      { 
-                        status: closedTrade.status, 
-                        exitPrice: closedTrade.exitPrice, 
-                        pnlPercent: closedTrade.pnlPercent, 
-                        updatedAt: new Date() 
-                      }
-                    );
-                  } catch(err) {}
-                }
-                activeTrades = activeTrades.filter((t: any) => t.id !== existingTrade.id);
-              }
-            }
-
-            triggeredSignals++;
-            let tps: [number, number, number, number];
-            let sl: number;
-
-            const p1 = config.tp[0];
-            const p2 = config.tp[1];
-            const p3 = config.tp[2];
-            const p4 = config.tp[3];
-            const slPct = config.sl;
-
-            if (signal === 'LONG') {
-              sl = closePrice * (1 - slPct / 100);
-              tps = [
-                closePrice * (1 + p1 / 100),
-                closePrice * (1 + p2 / 100),
-                closePrice * (1 + p3 / 100),
-                closePrice * (1 + p4 / 100)
-              ];
-            } else {
-              sl = closePrice * (1 + slPct / 100);
-              tps = [
-                closePrice * (1 - p1 / 100),
-                closePrice * (1 - p2 / 100),
-                closePrice * (1 - p3 / 100),
-                closePrice * (1 - p4 / 100)
-              ];
-            }
-
-            const baseSize = 10000 * 0.02 * config.risk * 3;
-            const now = new Date();
-            const dateKey = `${String(now.getUTCDate()).padStart(2, '0')}${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
-            const count = await getNextTradeCount(dateKey);
-            const tradeId = `${dateKey}${String(count).padStart(2, '0')}`;
-
-            const tradeRecord = new TradeModel({
-              tradeId, symbol: coin, direction: signal, entryPrice: closePrice, status: "OPEN", pnlPercent: 0
-            });
-            await tradeRecord.save();
-
-            const newTrade: any = {
-              id: Math.random().toString(36).substring(2, 7).toUpperCase(),
-              dbId: tradeId, symbol: coin, direction: signal, entry: closePrice, tp: tps[0], tps, sl, currentPrice: closePrice,
-              size: baseSize, risk: config.risk, realizedTps: [false, false, false, false], initialSize: baseSize, partialPnlRealized: 0
-            };
-
-            activeTrades.push(newTrade);
-            state.activeTrades = activeTrades;
-            state.closedTrades = closedTrades;
-            state.stats = stats;
-            
-            const successMsg = `>>> SYSTEM SCANNER TRIGGER: ${coin} ${signal} @ $${formatPrice(closePrice)} generated! Trade ${tradeId} recorded.`;
-            logs.unshift(`[${new Date().toLocaleTimeString()}] ${successMsg}`);
-            state.logs = logs.slice(0, 40);
-
-            await saveSystemState(state);
-
-            const msg = `[CRON TRIGGERED] Symbol: ${coin}\n` +
-              `Direction: ${signal}\n` +
-              `TP Levels: ${formatPrice(tps[0])}, ${formatPrice(tps[1])}, ${formatPrice(tps[2])}, ${formatPrice(tps[3])}\n` +
-              `SL Level: ${formatPrice(sl)}`;
-            await sendTelegramMessage(msg, signal);
-          }
+          const msg = `[CRON TRIGGERED] Symbol: ${coin}\n` +
+            `Direction: ${signal}\n` +
+            `TP Levels: ${formatPrice(tps[0])}, ${formatPrice(tps[1])}, ${formatPrice(tps[2])}, ${formatPrice(tps[3])}\n` +
+            `SL Level: ${formatPrice(sl)}`;
+          await sendTelegramMessage(msg, signal);
         }
-      } catch(e) {}
+      }
     }
+
+    // Save final state ONCE to eliminate lock contentions/race conditions
+    state.activeTrades = activeTrades;
+    state.closedTrades = closedTrades.slice(0, 40);
+    state.stats = stats;
+    state.logs = logs.slice(0, 40);
+    await saveSystemState(state);
 
     console.log(`[CRON] Background market scan complete. Triggered ${triggeredSignals} valid signals.`);
     return triggeredSignals;

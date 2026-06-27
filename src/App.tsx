@@ -199,12 +199,12 @@ export default function App() {
           if (data.closedTrades) setClosedTrades(data.closedTrades);
           if (data.stats) setStats(data.stats);
           if (data.logs) setTerminalLogs(data.logs);
-          if (data.filterAdx !== undefined) setFilterAdx(data.filterAdx);
-          if (data.filterMtf !== undefined) setFilterMtf(data.filterMtf);
-          if (data.filterEma !== undefined) setFilterEma(data.filterEma);
-          if (data.filterVolume !== undefined) setFilterVolume(data.filterVolume);
-          if (data.filterFunding !== undefined) setFilterFunding(data.filterFunding);
-          if (data.filterLiquidity !== undefined) setFilterLiquidity(data.filterLiquidity);
+          if (data.filterAdx !== undefined && data.filterAdx !== null) setFilterAdx(data.filterAdx);
+          if (data.filterMtf !== undefined && data.filterMtf !== null) setFilterMtf(data.filterMtf);
+          if (data.filterEma !== undefined && data.filterEma !== null) setFilterEma(data.filterEma);
+          if (data.filterVolume !== undefined && data.filterVolume !== null) setFilterVolume(data.filterVolume);
+          if (data.filterFunding !== undefined && data.filterFunding !== null) setFilterFunding(data.filterFunding);
+          if (data.filterLiquidity !== undefined && data.filterLiquidity !== null) setFilterLiquidity(data.filterLiquidity);
         }
         loadedStateDb.current = true;
       })
@@ -903,28 +903,6 @@ export default function App() {
              </div>
 
              <div className="flex items-center gap-3 font-mono">
-                 <button 
-                    onClick={async () => {
-                      if (!confirm("Are you sure you want to reset the entire database? This will clear all trades, stats, and logs.")) return;
-                      writeLog("[SYSTEM] Initiating full database reset...");
-                      try {
-                        const res = await fetch("/api/db/reset", { method: "POST" });
-                        const data = await res.json();
-                        if (data.success) {
-                          writeLog(`[SYSTEM SUCCESS] Database reset complete.`);
-                          setTimeout(() => window.location.reload(), 1000);
-                        } else {
-                          writeLog(`[SYSTEM ERROR] Failed to reset database`);
-                        }
-                      } catch (err: any) {
-                        writeLog(`[SYSTEM EXCEPTION] ${err.message}`);
-                      }
-                    }}
-                    className={cn("flex items-center gap-2 px-3 py-1.5 rounded-[4px] font-bold text-[9px] uppercase tracking-widest transition-all border", "bg-rose-500/5 text-rose-400 border-rose-500/20 hover:bg-rose-500/10")}
-                 >
-                    <Database size={10} strokeWidth={3}/>
-                    Reset System
-                 </button>
              </div>
          </header>
 

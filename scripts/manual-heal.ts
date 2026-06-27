@@ -18,6 +18,76 @@ const TradeSchema = new mongoose.Schema({
 
 const TradeModel = mongoose.model("Trade", TradeSchema);
 
+function calculateClosedTradeCorrectPnl(t: any, config: any) {
+  const entryPrice = t.entry || t.entryPrice;
+  const exitPrice = t.exitPrice || entryPrice;
+  const direction = t.direction;
+  const isLong = direction === 'LONG';
+  
+  if (!entryPrice || !direction) return { pnlPercent: 0, pnl: 0 };
+
+  const p1 = config.tp[0];
+  const p2 = config.tp[1];
+  const p3 = config.tp[2];
+  const p4 = config.tp[3];
+  
+  let tp1Price: number;
+  let tp2Price: number;
+  let tp3Price: number;
+  let tp4Price: number;
+
+  if (isLong) {
+    tp1Price = entryPrice * (1 + p1 / 100);
+    tp2Price = entryPrice * (1 + p2 / 100);
+    tp3Price = entryPrice * (1 + p3 / 100);
+    tp4Price = entryPrice * (1 + p4 / 100);
+  } else {
+    tp1Price = entryPrice * (1 - p1 / 100);
+    tp2Price = entryPrice * (1 - p2 / 100);
+    tp3Price = entryPrice * (1 - p3 / 100);
+    tp4Price = entryPrice * (1 - p4 / 100);
+  }
+
+  let realizedTps = [...(t.realizedTps || [false, false, false, false])];
+  
+  // If realizedTps array not defined/empty, and status is WIN, infer TP1 was hit
+  if ((!t.realizedTps || t.realizedTps.every((v: boolean) => !v)) && t.status === 'WIN') {
+    realizedTps = [true, false, false, false];
+    if (isLong) {
+      if (exitPrice >= tp3Price) realizedTps = [true, true, true, false];
+      else if (exitPrice >= tp2Price) realizedTps = [true, true, false, false];
+      else if (exitPrice >= tp1Price) realizedTps = [true, false, false, false];
+    } else {
+      if (exitPrice <= tp3Price) realizedTps = [true, true, true, false];
+      else if (exitPrice <= tp2Price) realizedTps = [true, true, false, false];
+      else if (exitPrice <= tp1Price) realizedTps = [true, false, false, false];
+    }
+  }
+
+  const alloc = config.alloc || [40, 30, 20, 10];
+  const initialSize = t.initialSize || t.size || 100;
+  
+  let partialPnlRealized = 0;
+  let remainingSize = initialSize;
+
+  for (let i = 0; i < 4; i++) {
+    if (realizedTps[i]) {
+      const partShare = alloc[i] / 100;
+      const partSize = initialSize * partShare;
+      const targetPrice = i === 0 ? tp1Price : (i === 1 ? tp2Price : (i === 2 ? tp3Price : tp4Price));
+      const partPnl = (partSize * (isLong ? (targetPrice - entryPrice) : (entryPrice - targetPrice))) / entryPrice;
+      partialPnlRealized += partPnl;
+      remainingSize = Math.max(0, remainingSize - partSize);
+    }
+  }
+
+  const remainingPnl = (remainingSize * (isLong ? (exitPrice - entryPrice) : (entryPrice - exitPrice))) / entryPrice;
+  const totalPnl = partialPnlRealized + remainingPnl;
+  const pnlPercent = (totalPnl / initialSize) * 100;
+
+  return { pnlPercent, pnl: totalPnl };
+}
+
 async function runManualHeal() {
   console.log("==========================================================================");
   console.log("               SRADE SYSTEM DATABASE MANUAL HEALING RUN                   ");
@@ -80,11 +150,16 @@ async function runManualHeal() {
       let newPnlPercent = oldPnlPercent;
 
       if (doc.status !== "OPEN") {
-        const exitPrice = doc.exitPrice || correctTps[3];
-        newPnlPercent = direction === 'LONG'
-          ? ((exitPrice - entryPrice) / entryPrice) * 100
-          : ((entryPrice - exitPrice) / entryPrice) * 100;
-        
+        if (newPnlPercent === undefined || newPnlPercent === null || newPnlPercent === 0) {
+          const calcResult = calculateClosedTradeCorrectPnl({
+            entry: entryPrice,
+            exitPrice: doc.exitPrice || entryPrice,
+            direction,
+            status: doc.status,
+            realizedTps: (doc as any).realizedTps
+          }, config);
+          newPnlPercent = calcResult.pnlPercent;
+        }
         doc.pnlPercent = newPnlPercent;
         healedTradesCount++;
       }
@@ -199,13 +274,19 @@ async function runManualHeal() {
         }
         t.tp = t.tps[0];
 
-        const exitPrice = t.exitPrice || t.tps[3];
-        const correctPnlPercent = direction === 'LONG'
-          ? ((exitPrice - entryPrice) / entryPrice) * 100
-          : ((entryPrice - exitPrice) / entryPrice) * 100;
-
-        t.pnlPercent = correctPnlPercent;
-        t.pnl = (t.initialSize || t.size) * (correctPnlPercent / 100);
+        let finalPnlPercent = t.pnlPercent;
+        let finalPnl = t.pnl;
+        
+        if (finalPnlPercent === undefined || finalPnlPercent === null || finalPnlPercent === 0) {
+          const calcResult = calculateClosedTradeCorrectPnl(t, config);
+          finalPnlPercent = calcResult.pnlPercent;
+          finalPnl = calcResult.pnl;
+        } else {
+          finalPnl = (t.initialSize || t.size) * (finalPnlPercent / 100);
+        }
+        
+        t.pnlPercent = finalPnlPercent;
+        t.pnl = finalPnl;
         closedHealed++;
         stateChanged = true;
       }
@@ -217,7 +298,7 @@ async function runManualHeal() {
       for (const t of closedTrades) {
         const tradePnl = t.pnl || 0;
         calculatedTotalPnl += tradePnl;
-        if (tradePnl > 0) {
+        if (tradePnl > 0 || t.status === "WIN") {
           calculatedWon++;
           t.status = "WIN";
         } else {
