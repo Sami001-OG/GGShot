@@ -23,6 +23,17 @@ async function startServer() {
   // Mount API routes from the separated module for Vercel
   app.use(apiApp);
 
+  // Catch-all for unhandled API routes so they don't fall through to Vite SPA fallback
+  app.use("/api", (req, res, next) => {
+    res.status(404).json({ error: "API Route Not Found" });
+  });
+  
+  // API Error handler
+  app.use("/api", (err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error("API Error:", err);
+    res.status(500).json({ error: "Internal API Error", message: err.message });
+  });
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

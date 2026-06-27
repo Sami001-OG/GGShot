@@ -261,8 +261,74 @@ async function healExistingTradesInDatabase() {
       const stateDoc = await targetDb.collection("system_state").findOne({ id: "main" });
       if (stateDoc) {
         let stateChanged = false;
-        const activeTrades = stateDoc.activeTrades || [];
-        const closedTrades = stateDoc.closedTrades || [];
+        let activeTrades = stateDoc.activeTrades || [];
+        let closedTrades = stateDoc.closedTrades || [];
+        
+        // RECONSTRUCT SYSTEM STATE FROM TRADEMODEL IF EMPTY
+        if (activeTrades.length === 0 && closedTrades.length === 0 && trades.length > 0) {
+          console.log("[DATABASE HEALER] System state empty but TradeModel has data. Reconstructing...");
+          for (const doc of trades) {
+            const coin = doc.symbol;
+            const config = COIN_CONFIGS[coin] || DEFAULT_CONFIG;
+            const entryPrice = doc.entryPrice;
+            if (!entryPrice || !coin || !doc.direction) continue;
+            
+            const p1 = config.tp[0];
+            const p2 = config.tp[1];
+            const p3 = config.tp[2];
+            const p4 = config.tp[3];
+            const slPct = config.sl;
+            
+            let tps: [number, number, number, number] = [0,0,0,0];
+            let sl = 0;
+            if (doc.direction === 'LONG') {
+              sl = entryPrice * (1 - slPct / 100);
+              tps = [
+                entryPrice * (1 + p1 / 100),
+                entryPrice * (1 + p2 / 100),
+                entryPrice * (1 + p3 / 100),
+                entryPrice * (1 + p4 / 100)
+              ];
+            } else {
+              sl = entryPrice * (1 + slPct / 100);
+              tps = [
+                entryPrice * (1 - p1 / 100),
+                entryPrice * (1 - p2 / 100),
+                entryPrice * (1 - p3 / 100),
+                entryPrice * (1 - p4 / 100)
+              ];
+            }
+            
+            const tradeObj: any = {
+              id: doc.tradeId,
+              dbId: doc.tradeId,
+              symbol: coin,
+              direction: doc.direction,
+              entry: entryPrice,
+              currentPrice: doc.exitPrice || entryPrice,
+              tp: tps[0],
+              tps,
+              sl,
+              size: 10000 * 0.02,
+              initialSize: 10000 * 0.02,
+              risk: config.risk,
+              realizedTps: [false, false, false, false],
+              partialPnlRealized: 0,
+              timestamp: doc.timestamp ? new Date(doc.timestamp).getTime() : Date.now(),
+              status: doc.status,
+              pnlPercent: doc.pnlPercent || 0,
+              pnl: 0,
+              exitPrice: doc.exitPrice || 0
+            };
+            
+            if (doc.status === "OPEN") {
+              activeTrades.push(tradeObj);
+            } else {
+              closedTrades.push(tradeObj);
+            }
+          }
+          stateChanged = true;
+        }
         
         for (const t of activeTrades) {
           const coin = t.symbol;
@@ -1652,8 +1718,8 @@ app.get("/api/admin/heal", async (req, res) => {
 });
 
 app.get("/api/db/state", async (req, res) => {
-  if (!db) {
-    return res.json({ activeTrades: [], closedTrades: [], stats: { balance: 10000, won: 0, lost: 0, totalPnl: 0 }, logs: ["Database not initialized, running in memory fallback"] });
+  if (!db || db === memoryDb) {
+    return res.json({ error: true, message: "Database not initialized", activeTrades: [], closedTrades: [], stats: { balance: 10000, won: 0, lost: 0, totalPnl: 0 }, logs: ["Database not initialized, running in memory fallback"] });
   }
   try {
     const stateRecord = await withDbTimeout(
@@ -1668,7 +1734,7 @@ app.get("/api/db/state", async (req, res) => {
     }
   } catch (error) {
     console.error("[STATE GET ERROR] Fallback to default state:", error);
-    res.json({ activeTrades: [], closedTrades: [], stats: { balance: 10000, won: 0, lost: 0, totalPnl: 0 }, logs: [] });
+    res.json({ error: true, message: "DB Error", activeTrades: [], closedTrades: [], stats: { balance: 10000, won: 0, lost: 0, totalPnl: 0 }, logs: [] });
   }
 });
 
@@ -1709,6 +1775,20 @@ app.post("/api/db/state", async (req, res) => {
     }
     if (statsToSave === undefined) {
       statsToSave = currentState ? (currentState.stats || { balance: 10000, won: 0, lost: 0, totalPnl: 0 }) : { balance: 10000, won: 0, lost: 0, totalPnl: 0 };
+    }
+
+    if (currentState) {
+      const hasDbData = (currentState.activeTrades && currentState.activeTrades.length > 0) || 
+                        (currentState.closedTrades && currentState.closedTrades.length > 0);
+      const isClientEmpty = (!activeTrades || activeTrades.length === 0) && 
+                            (!closedTrades || closedTrades.length === 0);
+      
+      if (hasDbData && isClientEmpty) {
+        console.warn("[STATE POST SAFETY] Rejected empty state overwrite because database already contains trade records.");
+        activeTradesToSave = currentState.activeTrades || [];
+        closedTradesToSave = currentState.closedTrades || [];
+        statsToSave = currentState.stats || statsToSave;
+      }
     }
 
     if (currentState) {
@@ -2140,7 +2220,7 @@ app.post("/api/db/reset", async (req, res) => {
     // Re-init default state in db
     const initialState = { 
       id: "main",
-      stats: { balance: 0, won: 0, lost: 0, totalPnl: 0 },
+      stats: { balance: 10000, won: 0, lost: 0, totalPnl: 0 },
       activeTrades: [],
       closedTrades: [],
       logs: [],

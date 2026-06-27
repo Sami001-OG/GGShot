@@ -127,9 +127,16 @@ export default function App() {
 
   const triggerFullSync = () => {
     fetch('/api/db/state')
-      .then(res => res.json())
+      .then(async (res) => {
+        const text = await res.text();
+        try {
+          return JSON.parse(text);
+        } catch (e) {
+          return { error: true, message: "Invalid JSON response" };
+        }
+      })
       .then(data => {
-        if (!data.error) {
+        if (data && !data.error) {
           if (data.activeTrades) {
             setActiveTrades(prev => {
               return data.activeTrades.map((t: any) => {
@@ -155,7 +162,14 @@ export default function App() {
     setHealMessage(null);
     try {
       const res = await fetch('/api/admin/heal');
-      const data = await res.json();
+      const text = await res.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        throw new Error("Invalid JSON from heal endpoint: " + text.slice(0, 50));
+      }
+      
       if (data.success) {
         setHealMessage("Database healed!");
         writeLog("[DATABASE HEALER] Success: Existing trade records and system state successfully healed.");
@@ -174,12 +188,18 @@ export default function App() {
   // Fetch server status config
   const reloadTelegramStatus = () => {
     fetch('/api/telegram/status')
-      .then(res => res.json())
+      .then(async res => {
+        const text = await res.text();
+        try { return JSON.parse(text); }
+        catch (e) { return { error: true, message: "Invalid JSON response" }; }
+      })
       .then(data => {
-        setTgBackendStatus(data);
-        if (data.configured && localStorage.getItem('tg_enabled') === null) {
-          setTgEnabled(true);
-          localStorage.setItem('tg_enabled', 'true');
+        if (data && !data.error) {
+          setTgBackendStatus(data);
+          if (data.configured && localStorage.getItem('tg_enabled') === null) {
+            setTgEnabled(true);
+            localStorage.setItem('tg_enabled', 'true');
+          }
         }
       })
       .catch(() => {});
@@ -190,28 +210,50 @@ export default function App() {
   useEffect(() => {
     reloadTelegramStatus();
     
-    // Load state from DB
-    fetch('/api/db/state')
-      .then(res => res.json())
-      .then(data => {
-        if (!data.error) {
-          if (data.activeTrades) setActiveTrades(data.activeTrades);
-          if (data.closedTrades) setClosedTrades(data.closedTrades);
-          if (data.stats) setStats(data.stats);
-          if (data.logs) setTerminalLogs(data.logs);
-          if (data.filterAdx !== undefined && data.filterAdx !== null) setFilterAdx(data.filterAdx);
-          if (data.filterMtf !== undefined && data.filterMtf !== null) setFilterMtf(data.filterMtf);
-          if (data.filterEma !== undefined && data.filterEma !== null) setFilterEma(data.filterEma);
-          if (data.filterVolume !== undefined && data.filterVolume !== null) setFilterVolume(data.filterVolume);
-          if (data.filterFunding !== undefined && data.filterFunding !== null) setFilterFunding(data.filterFunding);
-          if (data.filterLiquidity !== undefined && data.filterLiquidity !== null) setFilterLiquidity(data.filterLiquidity);
-        }
-        loadedStateDb.current = true;
-      })
-      .catch((err) => {
-        console.error("Failed to load DB state:", err);
-        loadedStateDb.current = true;
-      });
+    let isMounted = true;
+    const loadState = () => {
+      fetch('/api/db/state')
+        .then(async (res) => {
+          const text = await res.text();
+          try {
+            return JSON.parse(text);
+          } catch (e) {
+            return { error: true, message: "Invalid JSON response" };
+          }
+        })
+        .then(data => {
+          if (!isMounted) return;
+          if (data && !data.error) {
+            if (data.activeTrades) setActiveTrades(data.activeTrades);
+            if (data.closedTrades) setClosedTrades(data.closedTrades);
+            if (data.stats) setStats(data.stats);
+            if (data.logs) setTerminalLogs(data.logs);
+            if (data.filterAdx !== undefined && data.filterAdx !== null) setFilterAdx(data.filterAdx);
+            if (data.filterMtf !== undefined && data.filterMtf !== null) setFilterMtf(data.filterMtf);
+            if (data.filterEma !== undefined && data.filterEma !== null) setFilterEma(data.filterEma);
+            if (data.filterVolume !== undefined && data.filterVolume !== null) setFilterVolume(data.filterVolume);
+            if (data.filterFunding !== undefined && data.filterFunding !== null) setFilterFunding(data.filterFunding);
+            if (data.filterLiquidity !== undefined && data.filterLiquidity !== null) setFilterLiquidity(data.filterLiquidity);
+            
+            setTimeout(() => {
+              loadedStateDb.current = true;
+            }, 1000);
+          } else {
+            console.warn("DB State API returned error or pending, retrying in 3s...", data ? data.message : "");
+            setTimeout(loadState, 3000);
+          }
+        })
+        .catch((err) => {
+          if (!isMounted) return;
+          console.warn("Failed to load DB state, retrying in 3s");
+          setTimeout(loadState, 3000);
+        });
+    };
+
+    loadState();
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   const closedTradesRef = useRef<ClosedTrade[]>([]);
@@ -224,9 +266,16 @@ export default function App() {
     const syncInterval = setInterval(() => {
       if (!loadedStateDb.current) return;
       fetch('/api/db/state')
-        .then(res => res.json())
+        .then(async (res) => {
+          const text = await res.text();
+          try {
+            return JSON.parse(text);
+          } catch (e) {
+            return { error: true, message: "Invalid JSON response" };
+          }
+        })
         .then(data => {
-          if (!data.error) {
+          if (data && !data.error) {
             if (data.activeTrades) {
               setActiveTrades(prev => {
                 return data.activeTrades.map((t: any) => {
@@ -253,7 +302,7 @@ export default function App() {
             }
           }
         })
-        .catch(console.error);
+        .catch(() => {});
     }, 3000);
     return () => clearInterval(syncInterval);
   }, []);
@@ -309,7 +358,9 @@ export default function App() {
           imageType
         })
       });
-      const data = await res.json();
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch (e) { throw new Error("Invalid JSON from notify API"); }
       if (!res.ok) {
         console.error('Telegram endpoint returned error:', data.message);
       } else {
@@ -600,11 +651,15 @@ export default function App() {
     try {
       setApiError(null);
       const statusRes = await fetch('/api/binance/status');
-      const statusData = await statusRes.json();
+      const statusText = await statusRes.text();
+      let statusData;
+      try { statusData = JSON.parse(statusText); } catch (e) { throw new Error("Invalid JSON status"); }
       setBinanceStatus(statusData);
 
       const pricesRes = await fetch('/api/binance/prices');
-      const pricesData = await pricesRes.json();
+      const pricesText = await pricesRes.text();
+      let pricesData;
+      try { pricesData = JSON.parse(pricesText); } catch (e) { throw new Error("Invalid JSON prices"); }
       if (pricesData.prices) {
         setLivePrices(pricesData.prices);
         
@@ -778,7 +833,9 @@ export default function App() {
           chunk.map(async (coin) => {
             try {
               const res = await fetch(`/api/binance/metrics/${coin}`);
-              const data = await res.json();
+              const text = await res.text();
+              let data;
+              try { data = JSON.parse(text); } catch (e) { throw new Error("Invalid JSON"); }
               if (data && data.success && data.candles && data.candles.length > 0) {
                 initialCandles[coin] = data.candles;
               } else {
@@ -811,7 +868,9 @@ export default function App() {
     const loadSelectedHistory = async () => {
       try {
         const res = await fetch(`/api/binance/metrics/${selectedCoin}`);
-        const data = await res.json();
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch (e) { throw new Error("Invalid JSON"); }
         if (isMounted && data && data.success && data.candles && data.candles.length > 0) {
           setCoinsCandles(prev => ({
             ...prev,
@@ -935,7 +994,10 @@ export default function App() {
                              <button 
                                onClick={() => {
                                  setTerminalLogs(prev => [`[${new Date().toLocaleTimeString()}] Triggering backend autonomous scan...`, ...prev].slice(0, 40));
-                                 fetch('/api/cron').then(r => r.json()).then(d => {
+                                 fetch('/api/cron').then(async r => {
+                                   const text = await r.text();
+                                   return JSON.parse(text);
+                                 }).then(d => {
                                    setTerminalLogs(prev => [`[${new Date().toLocaleTimeString()}] Scan complete: ${d.message}`, ...prev].slice(0, 40));
                                  }).catch(e => console.error(e));
                                }}
