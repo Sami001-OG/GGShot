@@ -1,6 +1,8 @@
+import dns from "dns";
+dns.setDefaultResultOrder("ipv4first");
+
 import express from "express";
 import path from "path";
-import dns from "dns";
 import dotenv from "dotenv";
 import { MongoClient } from "mongodb";
 import mongoose from "mongoose";
@@ -507,7 +509,7 @@ async function fetchBinanceKlines(symbol: string, interval = "1h", limit = 1000)
     }
   });
   
-  if (r.status === 418 || r.status === 429) {
+  if (r.status === 418 || r.status === 429 || r.status === 451 || r.status === 403) {
     console.warn(`[BINANCE API] Futures IP Banned or Rate Limited (Status ${r.status}). Falling back to Spot API for ${symbol}...`);
     r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`, {
       signal: AbortSignal.timeout(10000),
@@ -872,10 +874,17 @@ async function updateCoinCandleCacheAndCheck(coin: string, k: any) {
   console.log(`[LOW-LATENCY RUNTIME] Successfully executed and stored trade: ${tradeId}`);
 
   sendTelegramMessage(
-    `Symbol: ${coin}\n` +
-    `Direction: ${signal}\n` +
-    `TP Levels: ${formatPrice(tps[0])}, ${formatPrice(tps[1])}, ${formatPrice(tps[2])}, ${formatPrice(tps[3])}\n` +
-    `SL Level: ${formatPrice(sl)}`,
+    `⚡ <b>New Setup Detected!</b>\n\n` +
+    `The algorithm just caught a fresh momentum shift on <b>#${coin.replace(/USDT$/, '')}</b>.\n\n` +
+    `🧭 <b>Action:</b> ${signal === 'LONG' ? '🟢 Going LONG' : '🔴 Going SHORT'}\n` +
+    `🎯 <b>Entry:</b> $${formatPrice(entryPrice)}\n\n` +
+    `💰 <b>Take Profits:</b>\n` +
+    `   TP1: $${formatPrice(tps[0])}\n` +
+    `   TP2: $${formatPrice(tps[1])}\n` +
+    `   TP3: $${formatPrice(tps[2])}\n` +
+    `   TP4: $${formatPrice(tps[3])}\n\n` +
+    `🛡️ <b>Stop Loss:</b> $${formatPrice(sl)}\n\n` +
+    `<i>Trade safe and manage your risk!</i> 🎲`,
     signal
   ).catch(() => {});
 }
@@ -971,7 +980,10 @@ function processTradeUpdateServerLogic(
     loggedMsg = `[${isTrailingStop ? 'TRAILING STOP' : 'STOP LOSS'} HIT] ${trade.symbol} ${trade.direction} hit SL at ${formatPrice(slBound)}! Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`;
 
     sendTelegramMessage(
-      `${trade.symbol} hit SL`
+      `⛔ <b>Stop Loss Triggered</b>\n\n` +
+      `Our trade on <b>#${trade.symbol.replace(/USDT$/, '')}</b> was stopped out.\n\n` +
+      `📉 <b>Yield:</b> ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%\n\n` +
+      `<i>Risk management keeps us in the game. On to the next setup!</i> 💪`
     ).catch(() => {});
 
     return { nextActive: null, closedTrade: closed, updatedStats: stats, loggedMsg };
@@ -1003,7 +1015,11 @@ function processTradeUpdateServerLogic(
     loggedMsg = `[REVERSAL EXIT] ${trade.symbol} ${trade.direction} trend flipped! Exited remaining at ${formatPrice(currentPrice)}. Yield: ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%`;
 
     sendTelegramMessage(
-      `${trade.symbol} hit SL`
+      `🔄 <b>Reversal Detected</b>\n\n` +
+      `The momentum on <b>#${trade.symbol.replace(/USDT$/, '')}</b> has flipped against our position.\n` +
+      `Closing the remaining trade early to protect capital.\n\n` +
+      `📊 <b>Yield:</b> ${finalPercent >= 0 ? '+' : ''}${finalPercent.toFixed(2)}%\n\n` +
+      `<i>Smart exits are just as important as good entries.</i> 🧠`
     ).catch(() => {});
 
     return { nextActive: null, closedTrade: closed, updatedStats: stats, loggedMsg };
@@ -1039,8 +1055,10 @@ function processTradeUpdateServerLogic(
       else if (i === 3) nextSlText = 'TP3';
 
       sendTelegramMessage(
-        `${trade.symbol} hit TP${i+1}\n` +
-        `SL to ${nextSlText}`
+        `🎯 <b>Take Profit Hit!</b>\n\n` +
+        `Awesome! <b>#${trade.symbol.replace(/USDT$/, '')}</b> just smashed <b>TP${i+1}</b>.\n\n` +
+        `🛡️ <i>Stop Loss automatically moved to ${nextSlText}.</i>\n` +
+        `Let's let the rest ride! 🚀`
       ).catch(() => {});
       
       partialPnlRealized += partPnl;
@@ -1077,8 +1095,11 @@ function processTradeUpdateServerLogic(
     loggedMsg = `[TP4 COMPLETED] ${trade.symbol} target cycle achieved! Net PnL: +${finalPercent.toFixed(2)}%`;
 
     sendTelegramMessage(
-      `${trade.symbol} hit TP4\n` +
-      `SL to TP3`
+      `🏆 <b>Full Target Reached!</b>\n\n` +
+      `Flawless victory on <b>#${trade.symbol.replace(/USDT$/, '')}</b>!\n` +
+      `All targets hit. The position is now fully closed.\n\n` +
+      `📈 <b>Total Yield:</b> +${finalPercent.toFixed(2)}%\n\n` +
+      `<i>Great trade, onto the next one!</i> 🥂`
     ).catch(() => {});
 
     return { nextActive: null, closedTrade: closed, updatedStats: stats, loggedMsg };
@@ -1472,10 +1493,17 @@ async function processCoinKlineClose(coin: string, candleStartTime: number) {
 
     // Notify Telegram with rich, professional layout
     sendTelegramMessage(
-      `Symbol: ${coin}\n` +
-      `Direction: ${signal}\n` +
-      `TP Levels: ${formatPrice(tps[0])}, ${formatPrice(tps[1])}, ${formatPrice(tps[2])}, ${formatPrice(tps[3])}\n` +
-      `SL Level: ${formatPrice(sl)}`,
+      `⚡ <b>New Setup Detected!</b>\n\n` +
+      `The algorithm just caught a fresh momentum shift on <b>#${coin.replace(/USDT$/, '')}</b>.\n\n` +
+      `🧭 <b>Action:</b> ${signal === 'LONG' ? '🟢 Going LONG' : '🔴 Going SHORT'}\n` +
+      `🎯 <b>Entry:</b> $${formatPrice(entryPrice)}\n\n` +
+      `💰 <b>Take Profits:</b>\n` +
+      `   TP1: $${formatPrice(tps[0])}\n` +
+      `   TP2: $${formatPrice(tps[1])}\n` +
+      `   TP3: $${formatPrice(tps[2])}\n` +
+      `   TP4: $${formatPrice(tps[3])}\n\n` +
+      `🛡️ <b>Stop Loss:</b> $${formatPrice(sl)}\n\n` +
+      `<i>Trade safe and manage your risk!</i> 🎲`,
       signal
     ).catch(() => {});
 
@@ -1589,53 +1617,69 @@ async function processTelegramQueue() {
   if (isProcessingTelegramQueue) return;
   isProcessingTelegramQueue = true;
   
-  while (telegramQueue.length > 0) {
-    const item = telegramQueue[0];
-    try {
-      const activeToken = process.env.TELEGRAM_BOT_TOKEN;
-      const activeChatId = process.env.TELEGRAM_CHAT_ID;
-      if (!activeToken || !activeChatId) {
-        throw new Error("Telegram credentials are not configured on the server.");
-      }
-
-      let telegramUrl = `https://api.telegram.org/bot${activeToken}/sendMessage`;
-      let fetchOptions: any = {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: activeChatId, text: item.message, parse_mode: "HTML", disable_web_page_preview: true })
-      };
-
-      if (item.imageType === "LONG" || item.imageType === "SHORT") {
-        // Temporarily disabled photo sending for Render compatibility
-        // It falls back to standard text message.
-      }
-
-      const response = await fetch(telegramUrl, fetchOptions);
-      const telegramData = await response.json() as any;
-
-      if (!response.ok || !telegramData.ok) {
-        if (telegramData.error_code === 429 && telegramData.parameters?.retry_after) {
-          const retryAfter = telegramData.parameters.retry_after;
-          console.warn(`[TELEGRAM RATE LIMIT] 429 Too Many Requests. Waiting ${retryAfter}s before retry...`);
-          await new Promise(r => setTimeout(r, retryAfter * 1000 + 500));
-          continue; // Retry this item
-        } else {
-          console.error("[TELEGRAM API ERROR]", telegramData);
-          throw new Error(telegramData.description || `Telegram response status ${response.status}`);
+  try {
+    while (telegramQueue.length > 0) {
+      const item = telegramQueue[0];
+      try {
+        const activeToken = process.env.TELEGRAM_BOT_TOKEN;
+        const activeChatId = process.env.TELEGRAM_CHAT_ID;
+        if (!activeToken || !activeChatId) {
+          throw new Error("Telegram credentials are not configured on the server.");
         }
-      }
-      
-      item.resolve(telegramData);
-    } catch (e: any) {
-      console.error("[TELEGRAM GATEWAY EXCEPTION]", e.message || e);
-      item.reject(e);
-    }
 
-    telegramQueue.shift(); // Remove completed/failed
-    await new Promise(r => setTimeout(r, 2000)); // Enforce global rate limiting (1.5 - 2s)
+        let telegramUrl = `https://api.telegram.org/bot${activeToken}/sendMessage`;
+        let payload: any = { 
+           chat_id: activeChatId, 
+           parse_mode: "HTML", 
+           disable_web_page_preview: true 
+        };
+
+        if (item.imageType === "LONG") {
+          telegramUrl = `https://api.telegram.org/bot${activeToken}/sendPhoto`;
+          payload.photo = "https://placehold.co/600x400/0f172a/22c55e.png?text=LONG+SETUP&font=montserrat";
+          payload.caption = item.message;
+        } else if (item.imageType === "SHORT") {
+          telegramUrl = `https://api.telegram.org/bot${activeToken}/sendPhoto`;
+          payload.photo = "https://placehold.co/600x400/0f172a/ef4444.png?text=SHORT+SETUP&font=montserrat";
+          payload.caption = item.message;
+        } else {
+          payload.text = item.message;
+        }
+
+        let fetchOptions: any = {
+          method: "POST",
+          signal: AbortSignal.timeout(10000),
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        };
+
+        const response = await fetch(telegramUrl, fetchOptions);
+        const telegramData = await response.json() as any;
+
+        if (!response.ok || !telegramData.ok) {
+          if (telegramData.error_code === 429 && telegramData.parameters?.retry_after) {
+            const retryAfter = telegramData.parameters.retry_after;
+            console.warn(`[TELEGRAM RATE LIMIT] 429 Too Many Requests. Waiting ${retryAfter}s before retry...`);
+            await new Promise(r => setTimeout(r, retryAfter * 1000 + 500));
+            continue; // Retry this item
+          } else {
+            console.error("[TELEGRAM API ERROR]", telegramData);
+            throw new Error(telegramData.description || `Telegram response status ${response.status}`);
+          }
+        }
+        
+        item.resolve(telegramData);
+      } catch (e: any) {
+        console.error("[TELEGRAM GATEWAY EXCEPTION]", e.message || e);
+        item.reject(e);
+      }
+
+      telegramQueue.shift(); // Remove completed/failed
+      await new Promise(r => setTimeout(r, 2000)); // Enforce global rate limiting (1.5 - 2s)
+    }
+  } finally {
+    isProcessingTelegramQueue = false;
   }
-  
-  isProcessingTelegramQueue = false;
 }
 
 function sendTelegramMessage(message: string, imageType?: "LONG"|"SHORT"): Promise<any> {
@@ -1646,9 +1690,6 @@ function sendTelegramMessage(message: string, imageType?: "LONG"|"SHORT"): Promi
 }
 
 dotenv.config();
-
-// Ensure Node standardizes to IPv4 first to avoid localhost lookup latency
-dns.setDefaultResultOrder("ipv4first");
 
 const app = express();
 app.use(express.json());
@@ -1866,7 +1907,7 @@ async function runMarketScan() {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
       });
-      if (exchangeRes.status === 418 || exchangeRes.status === 429) {
+      if (exchangeRes.status === 418 || exchangeRes.status === 429 || exchangeRes.status === 451 || exchangeRes.status === 403) {
         exchangeRes = await fetch("https://api.binance.com/api/v3/exchangeInfo", {
           signal: AbortSignal.timeout(5000),
           headers: {
@@ -1879,7 +1920,7 @@ async function runMarketScan() {
         if (exchangeInfo && Array.isArray(exchangeInfo.symbols)) {
           // Spot API doesn't have contractType, so we filter by quoteAsset
           const dynamicSymbols = exchangeInfo.symbols
-            .filter((s: any) => (s.contractType === "PERPETUAL" || s.contractType === undefined) && s.quoteAsset === "USDT" && s.status === "TRADING")
+            .filter((s: any) => (s.contractType === "PERPETUAL" || s.contractType === "TRADIFI_PERPETUAL" || s.contractType === undefined) && s.quoteAsset === "USDT" && s.status === "TRADING")
             .map((s: any) => s.baseAsset);
           if (dynamicSymbols.length > 0) {
             // Combine with MAJOR_FUTURES and ensure uniqueness
@@ -2144,11 +2185,18 @@ async function runMarketScan() {
 
           await markKeyProcessed(processedKey);
 
-          const msg = `[CRON TRIGGERED] Symbol: ${coin}\n` +
-            `Direction: ${signal}\n` +
-            `TP Levels: ${formatPrice(tps[0])}, ${formatPrice(tps[1])}, ${formatPrice(tps[2])}, ${formatPrice(tps[3])}\n` +
-            `SL Level: ${formatPrice(sl)}`;
-          await sendTelegramMessage(msg, signal);
+          const msg = `⚡ <b>New Setup Detected!</b>\n\n` +
+            `The algorithm just caught a fresh momentum shift on <b>#${coin.replace(/USDT$/, '')}</b>.\n\n` +
+            `🧭 <b>Action:</b> ${signal === 'LONG' ? '🟢 Going LONG' : '🔴 Going SHORT'}\n` +
+            `🎯 <b>Entry:</b> $${formatPrice(closePrice)}\n\n` +
+            `💰 <b>Take Profits:</b>\n` +
+            `   TP1: $${formatPrice(tps[0])}\n` +
+            `   TP2: $${formatPrice(tps[1])}\n` +
+            `   TP3: $${formatPrice(tps[2])}\n` +
+            `   TP4: $${formatPrice(tps[3])}\n\n` +
+            `🛡️ <b>Stop Loss:</b> $${formatPrice(sl)}\n\n` +
+            `<i>Trade safe and manage your risk!</i> 🎲`;
+          await sendTelegramMessage(msg, signal).catch(e => console.error("[CRON TELEGRAM ERROR]", e));
         }
       }
     }
@@ -2173,6 +2221,12 @@ const AUTONOMOUS_SCAN_INTERVAL = 15 * 60 * 1000;
 setInterval(() => {
   runMarketScan();
 }, AUTONOMOUS_SCAN_INTERVAL);
+
+app.post("/api/cron/trigger", async (req, res) => {
+  runMarketScan();
+  res.json({ success: true });
+});
+
 // Initial scan on startup
 setTimeout(() => {
   runMarketScan();
